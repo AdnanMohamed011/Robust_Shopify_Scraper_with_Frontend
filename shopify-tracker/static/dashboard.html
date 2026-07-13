@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Product Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262a33;
+    --text: #e7e9ee; --muted: #9aa1ac; --accent: #5b8cff;
+    --green: #3ecf8e; --red: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--border); display:flex; justify-content:space-between; align-items:center;}
+  header h1 { font-size: 18px; margin:0; font-weight:600; }
+  main { padding: 24px 28px; max-width: 1100px; margin: 0 auto; }
+  .panel { background: var(--panel); border:1px solid var(--border); border-radius:10px; padding:18px 20px; margin-bottom:20px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input, select { background:#0f1115; border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font-size:13px; }
+  button { background: var(--accent); border:none; color:white; padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
+  button:hover { opacity:0.9; }
+  button.secondary { background: #262a33; }
+  table { width:100%; border-collapse: collapse; font-size:13px; margin-top: 12px;}
+  th { text-align:left; color:var(--muted); font-weight:500; padding: 8px 10px; border-bottom:1px solid var(--border); }
+  td { padding: 8px 10px; border-bottom:1px solid #1e2129; }
+  .badge { padding:2px 8px; border-radius:20px; font-size:11px; }
+  .badge.ok { background: rgba(62,207,142,0.15); color: var(--green); }
+  .badge.out { background: rgba(255,107,107,0.15); color: var(--red); }
+  .muted { color: var(--muted); font-size: 12px; }
+  img.thumb { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; vertical-align: middle; }
+  .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); align-items:center; justify-content:center; }
+  .modal { background: var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width: 480px; max-width: 90vw; }
+  h3 { margin-top:0; font-size:14px; color:var(--muted); font-weight:500; text-transform:uppercase; letter-spacing:0.05em;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📦 Product Tracker</h1>
+  <div class="row">
+    <select id="storeSelect"></select>
+    <button class="secondary" onclick="openAddStore()">+ Add Store</button>
+    <button class="secondary" onclick="openAddCollection()">+ Add Collection</button>
+    <button onclick="triggerScrape()">Scrape Now</button>
+    <button class="secondary" onclick="exportCsv()">⬇ Export CSV</button>
+  </div>
+</header>
+
+<main>
+  <div class="panel">
+    <h3>Recent Alerts (24h)</h3>
+    <div id="alerts" class="muted">Loading...</div>
+  </div>
+
+  <div class="panel">
+    <h3>Tracked Products</h3>
+    <table>
+      <thead><tr><th></th><th>Title</th><th>Collection</th><th>Variant</th><th>SKU</th><th>Price</th><th>Status</th><th>Last Seen</th><th></th></tr></thead>
+      <tbody id="productRows"></tbody>
+    </table>
+  </div>
+</main>
+
+<div class="modal-bg" id="storeModalBg">
+  <div class="modal">
+    <h3>Add Store</h3>
+    <div class="row" style="flex-direction:column; align-items:stretch;">
+      <input id="storeName" placeholder="Store name (e.g. Sana Safinaz)">
+      <input id="storeUrl" placeholder="https://example.com">
+      <input id="storeCurrency" placeholder="Currency code (e.g. USD, AED, PKR)" value="USD">
+      <div class="row" style="justify-content:flex-end;">
+        <button class="secondary" onclick="closeModal('storeModalBg')">Cancel</button>
+        <button onclick="submitStore()">Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="collectionModalBg">
+  <div class="modal">
+    <h3>Add Collection</h3>
+    <div class="row" style="flex-direction:column; align-items:stretch;">
+      <input id="collectionHandle" placeholder="collection-handle (from the URL)">
+      <div class="row" style="justify-content:flex-end;">
+        <button class="secondary" onclick="closeModal('collectionModalBg')">Cancel</button>
+        <button onclick="submitCollection()">Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const api = (path, opts) => fetch(path, opts).then(r => r.json());
+
+let loadedStores = [];
+
+async function loadStores() {
+  const stores = await api('/stores');
+  loadedStores = stores;
+  const sel = document.getElementById('storeSelect');
+  sel.innerHTML = stores.map(s => `<option value="${s.id}">${s.name}</option>`).join('') || '<option>No stores yet</option>';
+  sel.onchange = loadProducts;
+  if (stores.length) loadProducts();
+}
+
+function currentStoreCurrency() {
+  const id = currentStoreId();
+  const store = loadedStores.find(s => s.id === id);
+  return store ? store.currency : 'USD';
+}
+
+function currentStoreId() {
+  const sel = document.getElementById('storeSelect');
+  return sel.value ? parseInt(sel.value) : null;
+}
+
+async function loadProducts() {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  const products = await api(`/products?store_id=${storeId}`);
+  const currency = currentStoreCurrency();
+  const rows = document.getElementById('productRows');
+  rows.innerHTML = products.map(p => {
+    const variantParts = [p.option1_value, p.option2_value, p.option3_value].filter(v => v);
+    const variantLabel = variantParts.length ? variantParts.join(' / ') : '—';
+    return `
+    <tr>
+      <td>${p.image_url ? `<img class="thumb" src="${p.image_url}">` : ''}</td>
+      <td>${p.product_url ? `<a href="${p.product_url}" target="_blank" style="color:inherit;">${p.title}</a>` : p.title}</td>
+      <td class="muted">${p.collection_handle || '—'}</td>
+      <td class="muted">${variantLabel}</td>
+      <td class="muted">${p.sku || '—'}</td>
+      <td>${currency} ${p.price.toFixed(2)}</td>
+      <td><span class="badge ${p.available ? 'ok' : 'out'}">${p.available ? 'In stock' : 'Out of stock'}</span></td>
+      <td class="muted">${new Date(p.last_seen).toLocaleString()}</td>
+      <td><button class="secondary" onclick="viewHistory(${p.id})">History</button></td>
+    </tr>
+  `;
+  }).join('') || '<tr><td colspan="9" class="muted">No products yet — add a collection and hit Scrape Now.</td></tr>';
+}
+
+async function loadAlerts() {
+  const alerts = await api('/alerts?hours=24');
+  const el = document.getElementById('alerts');
+  if (!alerts.length) { el.innerHTML = 'No changes in the last 24 hours.'; return; }
+  el.innerHTML = alerts.map(a => `
+    <div style="padding:6px 0; border-bottom:1px solid #1e2129;">
+      <span class="badge ${a.change_type === 'price_drop' ? 'ok' : 'ok'}">${a.change_type.replace('_',' ')}</span>
+      Product #${a.product_id} → $${a.price.toFixed(2)} · ${new Date(a.recorded_at).toLocaleString()}
+    </div>
+  `).join('');
+}
+
+function openAddStore() { document.getElementById('storeModalBg').style.display = 'flex'; }
+function openAddCollection() { document.getElementById('collectionModalBg').style.display = 'flex'; }
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+
+async function submitStore() {
+  const name = document.getElementById('storeName').value.trim();
+  const base_url = document.getElementById('storeUrl').value.trim();
+  const currency = document.getElementById('storeCurrency').value.trim() || 'USD';
+  if (!name || !base_url) return;
+  await api('/stores', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, base_url, currency}) });
+  closeModal('storeModalBg');
+  await loadStores();
+}
+
+async function submitCollection() {
+  const storeId = currentStoreId();
+  const handle = document.getElementById('collectionHandle').value.trim();
+  if (!storeId || !handle) return;
+  await api(`/stores/${storeId}/collections`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({handle}) });
+  closeModal('collectionModalBg');
+}
+
+async function triggerScrape() {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  await api(`/scrape/${storeId}`, { method: 'POST' });
+  alert('Scrape started in the background — refresh in a few seconds.');
+  setTimeout(() => { loadProducts(); loadAlerts(); }, 4000);
+}
+
+function exportCsv() {
+  const storeId = currentStoreId();
+  if (!storeId) { alert('Add a store first.'); return; }
+  window.location.href = `/export/${storeId}/csv`;
+}
+
+async function viewHistory(productId) {
+  const data = await api(`/products/${productId}/history`);
+  const labels = data.history.map(h => new Date(h.recorded_at).toLocaleDateString());
+  const prices = data.history.map(h => h.price);
+  const win = window.open('', '_blank', 'width=500,height=400');
+  win.document.write('<canvas id="c"></canvas><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"><\/script>');
+  win.document.close();
+  win.onload = () => {
+    new win.Chart(win.document.getElementById('c'), {
+      type: 'line',
+      data: { labels, datasets: [{ label: data.product.title, data: prices, borderColor: '#5b8cff' }] }
+    });
+  };
+}
+
+loadStores();
+loadAlerts();
+setInterval(loadAlerts, 30000);
+</script>
+</body>
+</html>
