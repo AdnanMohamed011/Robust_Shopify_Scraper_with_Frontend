@@ -53,28 +53,3 @@ curl -X POST http://localhost:8000/stores/1/collections \
 curl -X POST http://localhost:8000/scrape/1
 ```
 
-## What's NOT here yet (needed for a real multi-tenant SaaS)
-
-Being straight about scope — this is the tracking engine, not a
-billable product yet. To sell this to other people you'd still need:
-
-1. **User accounts & auth** — right now anyone hitting the API can see
-   everyone's data. You'd add a `User` model, JWT or session auth, and
-   scope every query by `user_id`.
-2. **Billing** — Stripe subscriptions, usage limits (e.g. free tier =
-   1 store / 2 collections, paid tiers = more).
-3. **Notifications** — the `/alerts` endpoint exists but nothing pushes
-   it anywhere yet. Add email (SES/Resend) or a Discord/Slack webhook
-   so customers get pinged instead of having to check a dashboard.
-4. **Deployment** — this runs on SQLite on your machine right now. For
-   production, move to Postgres (one-line change in `database.py`) and
-   deploy on Railway/Render/Fly.io — all have cheap always-on tiers.
-5. **Rate limiting / politeness per store** — right now every store is
-   scraped independently on the same schedule. If you're tracking a lot
-   of stores, you'll want to stagger scrapes and respect each store's
-   rate limits more deliberately than the current fixed concurrency cap.
-
-Items 1–4 are the real path from "working tool" to "SaaS you can charge
-for." Happy to build any of them next — auth + Stripe is usually the
-highest-leverage next step since it's what turns this from a personal
-tool into a product.
