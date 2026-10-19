@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+tracker.db
+*.db
+.venv/
+venv/
+.env
+*_backup.py

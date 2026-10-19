@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --border: #262a33;
     --text: #e7e9ee; --muted: #9aa1ac; --accent: #5b8cff;
-    --green: #3ecf8e; --red: #ff6b6b;
+    --green: #3ecf8e; --red: #ff6b6b; --yellow: #e0b84c;
   }
   * { box-sizing: border-box; }
   body { margin:0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
@@ -20,18 +20,51 @@
   input, select { background:#0f1115; border:1px solid var(--border); color:var(--text); padding:8px 10px; border-radius:6px; font-size:13px; }
   button { background: var(--accent); border:none; color:white; padding:8px 14px; border-radius:6px; font-size:13px; cursor:pointer; }
   button:hover { opacity:0.9; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
   button.secondary { background: #262a33; }
   table { width:100%; border-collapse: collapse; font-size:13px; margin-top: 12px;}
   th { text-align:left; color:var(--muted); font-weight:500; padding: 8px 10px; border-bottom:1px solid var(--border); }
   td { padding: 8px 10px; border-bottom:1px solid #1e2129; }
-  .badge { padding:2px 8px; border-radius:20px; font-size:11px; }
+  .badge { padding:2px 8px; border-radius:20px; font-size:11px; white-space:nowrap; }
   .badge.ok { background: rgba(62,207,142,0.15); color: var(--green); }
   .badge.out { background: rgba(255,107,107,0.15); color: var(--red); }
+  .badge.error { background: rgba(255,107,107,0.15); color: var(--red); }
+  .badge.empty { background: rgba(224,184,76,0.15); color: var(--yellow); }
+  .badge.pending { background: rgba(154,161,172,0.15); color: var(--muted); }
   .muted { color: var(--muted); font-size: 12px; }
+  tr.active-collection td { background: rgba(91,140,255,0.08); }
   img.thumb { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; vertical-align: middle; }
   .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); align-items:center; justify-content:center; }
   .modal { background: var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width: 480px; max-width: 90vw; }
   h3 { margin-top:0; font-size:14px; color:var(--muted); font-weight:500; text-transform:uppercase; letter-spacing:0.05em;}
+  .spinner { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.25); border-top-color:#fff; border-radius:50%; animation: spin 0.7s linear infinite; vertical-align:middle; margin-right:6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #scrapeStatus { display:none; align-items:center; gap:8px; padding:8px 12px; border-radius:6px; font-size:13px; margin-bottom:14px; }
+  #scrapeStatus.info { background: rgba(91,140,255,0.12); color: var(--accent); }
+  #scrapeStatus.success { background: rgba(62,207,142,0.12); color: var(--green); }
+  #scrapeStatus.error { background: rgba(255,107,107,0.12); color: var(--red); }
+  #syncProgressWrap, #scrapeProgressWrap { margin-top: 10px; display: none; }
+  .progressTrack { background: #0f1115; border: 1px solid var(--border); border-radius: 6px; height: 8px; overflow: hidden; }
+  .progressFill { background: var(--accent); height: 100%; width: 0%; transition: width 0.3s ease; }
+  .progressFill.indeterminate {
+    width: 40% !important;
+    animation: progressPulse 1.3s ease-in-out infinite;
+  }
+  @keyframes progressPulse {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(250%); }
+  }
+  .progressLabel { font-size: 12px; color: var(--muted); margin-top: 6px; display: flex; justify-content: space-between; gap: 10px; }
+  #scrapeProgressCounts {
+    font-size: 14px; font-weight: 600; color: var(--text);
+  }
+  /* Alerts panel used to grow without limit and push everything else (the
+     actual scrape/product data people came here for) below the fold. Capped
+     height + its own scrollbar keeps it from taking over the page, while a
+     long history is still all reachable by scrolling inside just this box. */
+  #alerts { max-height: 220px; overflow-y: auto; padding-right: 4px; }
+  #alerts::-webkit-scrollbar { width: 8px; }
+  #alerts::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -39,18 +72,63 @@
 <header>
   <h1>📦 Product Tracker</h1>
   <div class="row">
+    <span id="scheduleBadge" class="badge pending" style="cursor:pointer;" title="Click to edit this store's own once-daily auto-scrape/sync time">Schedule: —</span>
+    <span id="scheduleEditRow" class="row" style="gap:4px; display:none;">
+      <input id="scheduleInput" type="time" style="width:110px;">
+      <span class="muted" style="font-size:12px;">UTC</span>
+      <button id="scheduleSaveBtn" class="secondary" style="font-size:12px;">Save</button>
+    </span>
     <select id="storeSelect"></select>
+    <span id="currencyStatus"></span>
+    <span class="row" style="gap:4px;" title="Currency your own Shopify store sells in -- every tracked store's prices convert into this on export/sync">
+      <span class="muted" style="font-size:12px;">Sell in</span>
+      <input id="targetCurrencyInput" type="text" maxlength="3" style="width:44px; text-transform:uppercase;">
+      <button id="targetCurrencySaveBtn" class="secondary" style="font-size:12px;">Save</button>
+    </span>
+    <span class="row" style="gap:4px;" title="Flat percentage markup added on top of the converted price, applied to both CSV export and Shopify sync">
+      <span class="muted" style="font-size:12px;">Margin</span>
+      <input id="marginInput" type="number" step="0.1" style="width:64px;">
+      <span class="muted">%</span>
+      <button class="secondary" onclick="saveMargin()">Save</button>
+    </span>
+    <button class="secondary needs-idle" onclick="deleteStore()" title="Delete the selected store and all its data">🗑 Delete Store</button>
+    <select id="collectionSelect"><option value="">All collections</option></select>
     <button class="secondary" onclick="openAddStore()">+ Add Store</button>
-    <button class="secondary" onclick="openAddCollection()">+ Add Collection</button>
-    <button onclick="triggerScrape()">Scrape Now</button>
+    <button class="secondary needs-idle" onclick="openAddCollection()">+ Add Collection</button>
+    <button id="scrapeBtn" onclick="triggerScrape()">Scrape Now</button>
+    <button id="stopScrapeBtn" class="secondary" onclick="stopScrape()" style="display:none;">■ Stop</button>
     <button class="secondary" onclick="exportCsv()">⬇ Export CSV</button>
+    <button class="secondary" onclick="openShopifySync()">🔄 Shopify Sync</button>
   </div>
 </header>
 
 <main>
+  <div id="scrapeStatus"></div>
+  <div id="scrapeProgressWrap">
+    <div id="scrapeProgressTrack" class="progressTrack"><div id="scrapeProgressFill" class="progressFill"></div></div>
+    <div id="scrapeProgressLabel" class="progressLabel"><span id="scrapeProgressText">Starting…</span><span id="scrapeProgressCounts"></span></div>
+  </div>
+
   <div class="panel">
     <h3>Recent Alerts (24h)</h3>
     <div id="alerts" class="muted">Loading...</div>
+  </div>
+
+  <div class="panel">
+    <h3>Shopify Sync</h3>
+    <div id="syncStatusPanel" class="muted">Loading...</div>
+    <div id="syncProgressWrap">
+      <div id="syncProgressTrack" class="progressTrack"><div id="syncProgressFill" class="progressFill"></div></div>
+      <div id="syncProgressLabel" class="progressLabel"><span id="syncProgressText">Starting…</span><span id="syncProgressCounts"></span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Collections</h3>
+    <table>
+      <thead><tr><th>Handle</th><th>Status</th><th>Last Scraped</th><th></th></tr></thead>
+      <tbody id="collectionRows"><tr><td colspan="4" class="muted">No store selected.</td></tr></tbody>
+    </table>
   </div>
 
   <div class="panel">
@@ -68,7 +146,7 @@
     <div class="row" style="flex-direction:column; align-items:stretch;">
       <input id="storeName" placeholder="Store name (e.g. Sana Safinaz)">
       <input id="storeUrl" placeholder="https://example.com">
-      <input id="storeCurrency" placeholder="Currency code (e.g. USD, AED, PKR)" value="USD">
+      <div class="muted" style="padding: 2px 2px 0;">Currency is detected automatically from the store after the first scrape — no need to enter it.</div>
       <div class="row" style="justify-content:flex-end;">
         <button class="secondary" onclick="closeModal('storeModalBg')">Cancel</button>
         <button onclick="submitStore()">Add</button>
@@ -90,18 +168,261 @@
   </div>
 </div>
 
+<div class="modal-bg" id="shopifySyncModalBg">
+  <div class="modal">
+    <h3>Shopify Sync Setup</h3>
+    <div class="row" style="flex-direction:column; align-items:stretch;">
+      <div class="muted" style="padding: 2px 2px 6px;">Connects to YOUR OWN Shopify store (not the store being tracked) so updates can be pushed automatically. Create an app under Settings → Apps and sales channels → Develop apps → Build apps in Dev Dashboard, with read/write access to Products and Inventory, then paste the Client ID and Client Secret below (found on the app's Settings page after you release/install it).</div>
+      <input id="shopifyDomain" placeholder="yourstore.myshopify.com">
+      <input id="shopifyClientId" placeholder="Client ID">
+      <input id="shopifyClientSecret" placeholder="Client Secret" type="password">
+      <label class="row" style="gap:6px;"><input type="checkbox" id="apiSyncEnabled" checked> Enable automatic price/stock sync</label>
+      <label class="row" style="gap:6px;"><input type="checkbox" id="autoCreateEnabled"> Also auto-create brand new products (not just update existing ones)</label>
+      <div class="row" style="justify-content:flex-end;">
+        <button class="secondary" onclick="closeModal('shopifySyncModalBg')">Cancel</button>
+        <button onclick="submitShopifyConnection()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
-const api = (path, opts) => fetch(path, opts).then(r => r.json());
+// Always throws on a failed request (network error, non-2xx status, or a
+// response body that isn't valid JSON) instead of silently swallowing it
+// -- a caller that doesn't explicitly catch this will still surface it via
+// the window-level handler below, rather than the click that triggered it
+// just appearing to do nothing.
+async function api(path, opts) {
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (e) {
+    throw new Error(`Network error reaching ${path}: ${e.message}`);
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch (e) {
+    // Non-JSON response (e.g. a raw 500 from an unhandled server error) --
+    // still surface *something* readable rather than throwing a cryptic
+    // JSON-parse error.
+    if (!res.ok) throw new Error(`${path} failed (HTTP ${res.status})`);
+    return null;
+  }
+  if (!res.ok) {
+    throw new Error(body?.detail || `${path} failed (HTTP ${res.status})`);
+  }
+  return body;
+}
+
+// Catches any api() failure that a caller didn't explicitly handle, so a
+// silent failure is never possible -- worst case, the user sees this
+// generic banner instead of nothing at all.
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled request failure:', event.reason);
+  setScrapeStatus('error', `⚠ ${event.reason?.message || 'Something went wrong — check your connection and try again.'}`);
+});
+const STORAGE_KEY = 'productTracker.selectedStoreId';
+const COLLECTION_STORAGE_PREFIX = 'productTracker.selectedCollection.';
 
 let loadedStores = [];
+let pollTimer = null;
+// Store IDs with a scrape or sync currently running, tracked client-side so
+// buttons can be disabled immediately without waiting on a poll tick -- the
+// server enforces the real lock (409s on a conflicting request); this is
+// just so the UI doesn't invite you to click something it's about to reject.
+let busyStores = new Set();
+function isBusy(storeId) { return busyStores.has(storeId); }
 
-async function loadStores() {
+async function loadStores(preferredId) {
   const stores = await api('/stores');
   loadedStores = stores;
   const sel = document.getElementById('storeSelect');
   sel.innerHTML = stores.map(s => `<option value="${s.id}">${s.name}</option>`).join('') || '<option>No stores yet</option>';
-  sel.onchange = loadProducts;
-  if (stores.length) loadProducts();
+  sel.onchange = () => { rememberSelectedStore(); loadProducts(); loadCollections(); loadSyncStatus(); loadMarginInput(); loadScheduleInput(); };
+
+  if (!stores.length) return;
+
+  const remembered = parseInt(localStorage.getItem(STORAGE_KEY));
+  const targetId = preferredId ?? (stores.some(s => s.id === remembered) ? remembered : stores[0].id);
+  sel.value = targetId;
+  rememberSelectedStore();
+  loadProducts();
+  loadCollections();
+  loadSyncStatus();
+  loadMarginInput();
+  loadScheduleInput();
+}
+
+function loadMarginInput() {
+  const id = currentStoreId();
+  const store = loadedStores.find(s => s.id === id);
+  document.getElementById('marginInput').value = store ? (store.margin_percent ?? 0) : 0;
+  renderCurrencyStatus();
+}
+
+let targetCurrency = null;
+async function loadTargetCurrency() {
+  try {
+    const settings = await api('/settings');
+    targetCurrency = settings.target_currency;
+    document.getElementById('targetCurrencyInput').value = targetCurrency || '';
+  } catch (e) { /* fall through -- status just won't render until this succeeds */ }
+  renderCurrencyStatus();
+}
+
+document.getElementById('targetCurrencySaveBtn').addEventListener('click', async () => {
+  const value = document.getElementById('targetCurrencyInput').value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(value)) { alert('Enter a 3-letter currency code, e.g. GBP, USD, EUR.'); return; }
+  const result = await api('/settings', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ target_currency: value }),
+  });
+  targetCurrency = result.target_currency;
+  renderCurrencyStatus();
+  setScrapeStatus('success', `✓ Now converting into ${targetCurrency}. Existing FX rates refresh on each store's next scrape.`);
+});
+
+// Flags a store whose currency conversion never resolved -- the backend
+// now refuses to export/sync in this state (rather than silently treating
+// raw source-currency numbers as already being in the target currency),
+// but this makes it visible at a glance instead of only as an error after
+// clicking something.
+function renderCurrencyStatus() {
+  const el = document.getElementById('currencyStatus');
+  if (!el) return;
+  const id = currentStoreId();
+  const store = loadedStores.find(s => s.id === id);
+  if (!store || !targetCurrency) { el.textContent = ''; return; }
+
+  if (!store.currency || (store.currency !== targetCurrency && !store.fx_rate_to_target)) {
+    el.innerHTML = `<span class="badge error" title="Export and sync are paused for this store until this resolves -- usually clears on the next scrape">⚠ FX rate unresolved (${store.currency || '?'} → ${targetCurrency})</span>`;
+  } else if (store.currency === targetCurrency) {
+    el.innerHTML = `<span class="muted" style="font-size:12px;">${store.currency} (no conversion needed)</span>`;
+  } else {
+    el.innerHTML = `<span class="muted" style="font-size:12px;">${store.currency} → ${targetCurrency} (rate: ${store.fx_rate_to_target.toFixed(4)})</span>`;
+  }
+}
+
+async function saveMargin() {
+  const id = currentStoreId();
+  if (!id) return;
+  const raw = document.getElementById('marginInput').value.trim();
+  const margin_percent = raw === '' ? 0 : parseFloat(raw);
+  if (Number.isNaN(margin_percent)) { setScrapeStatus('error', 'Margin must be a number.'); return; }
+
+  await api(`/stores/${id}/margin`, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ margin_percent }),
+  });
+  await loadStores(id);
+  setScrapeStatus('success', `✓ Margin set to ${margin_percent}% — applies on the next export or sync.`);
+  setTimeout(() => setScrapeStatus(null), 5000);
+}
+
+function loadScheduleInput() {
+  const id = currentStoreId();
+  const store = loadedStores.find(s => s.id === id);
+  document.getElementById('scheduleInput').value = store ? (store.scrape_times || '') : '';
+  renderScheduleBadge(store);
+  loadScheduleStatus();
+}
+
+// Renders the badge's main label immediately from data already loaded
+// with the store list (store.scrape_times) -- this is always correct
+// and needs no extra network round trip. loadScheduleStatus() below only
+// enriches the tooltip with the *next run* timestamp, which genuinely
+// does need a fresh call to the scheduler -- if that call is slow or
+// fails, the visible label is never left wrong or blank because of it.
+function renderScheduleBadge(store) {
+  const badge = document.getElementById('scheduleBadge');
+  if (!store) { badge.className = 'badge pending'; badge.textContent = 'Schedule: —'; badge.title = ''; return; }
+  if (store.scrape_times) {
+    badge.className = 'badge ok';
+    badge.textContent = `Schedule: ${store.scrape_times} UTC`;
+    badge.title = 'Loading next run time… (click to edit)';
+  } else {
+    badge.className = 'badge pending';
+    badge.textContent = 'Schedule: none';
+    badge.title = 'No automatic schedule set for this store -- click to add one.';
+  }
+}
+
+async function loadScheduleStatus() {
+  const id = currentStoreId();
+  const store = loadedStores.find(s => s.id === id);
+  if (!id || !store) return;
+  const badge = document.getElementById('scheduleBadge');
+  // If this badge has since moved on to a different store while this
+  // request was in flight, don't let a slow/stale response overwrite it.
+  const requestedForId = id;
+  try {
+    const status = await api(`/stores/${id}/schedule/status`);
+    if (currentStoreId() !== requestedForId) return;
+    if (status.active && status.next_run_at) {
+      const next = new Date(status.next_run_at).toLocaleString();
+      badge.title = `Next automatic run: ${next}. Click to edit.`;
+    } else {
+      badge.title = store.scrape_times
+        ? 'Schedule saved, but the server has no upcoming run time yet -- try refreshing in a moment.'
+        : 'No automatic schedule set for this store -- click to add one.';
+    }
+  } catch (e) {
+    if (currentStoreId() !== requestedForId) return;
+    // The main label already shows the correct, known-good value from
+    // store.scrape_times regardless of this failing -- only the "next
+    // run" tooltip detail is missing, never the label itself.
+    badge.title = 'Could not reach the server to check the next run time.';
+    console.error('Schedule status check failed:', e);
+  }
+}
+
+document.getElementById('scheduleBadge').addEventListener('click', () => {
+  const row = document.getElementById('scheduleEditRow');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+});
+
+document.getElementById('scheduleSaveBtn').addEventListener('click', async () => {
+  const id = currentStoreId();
+  if (!id) return;
+  const btn = document.getElementById('scheduleSaveBtn');
+  const scrape_time = document.getElementById('scheduleInput').value.trim();
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const result = await api(`/stores/${id}/schedule`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ scrape_time }),
+    });
+    document.getElementById('scheduleEditRow').style.display = 'none';
+    await loadStores(id);
+    setScrapeStatus('success', scrape_time
+      ? `✓ ${loadedStores.find(s => s.id === id)?.name || 'Store'} will auto-run daily at ${scrape_time} UTC`
+      : `✓ Automatic schedule cleared for this store — manual Scrape Now / Sync Now only.`);
+    setTimeout(() => setScrapeStatus(null), 6000);
+  } catch (e) {
+    alert('Failed to update schedule -- could not reach the server. Please try again.\n\n' + e.message);
+    console.error('Schedule save failed:', e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  }
+});
+
+function rememberSelectedStore() {
+  const id = currentStoreId();
+  if (id) localStorage.setItem(STORAGE_KEY, id);
+}
+
+function rememberSelectedCollection() {
+  const storeId = currentStoreId();
+  const handle = currentCollectionHandle();
+  if (storeId) localStorage.setItem(COLLECTION_STORAGE_PREFIX + storeId, handle || '');
+}
+
+function currentCollectionHandle() {
+  const sel = document.getElementById('collectionSelect');
+  return sel.value || null;
 }
 
 function currentStoreCurrency() {
@@ -118,7 +439,9 @@ function currentStoreId() {
 async function loadProducts() {
   const storeId = currentStoreId();
   if (!storeId) return;
-  const products = await api(`/products?store_id=${storeId}`);
+  const collection = currentCollectionHandle();
+  const url = `/products?store_id=${storeId}` + (collection ? `&collection=${encodeURIComponent(collection)}` : '');
+  const products = await api(url);
   const currency = currentStoreCurrency();
   const rows = document.getElementById('productRows');
   rows.innerHTML = products.map(p => {
@@ -126,7 +449,7 @@ async function loadProducts() {
     const variantLabel = variantParts.length ? variantParts.join(' / ') : '—';
     return `
     <tr>
-      <td>${p.image_url ? `<img class="thumb" src="${p.image_url}">` : ''}</td>
+      <td>${p.image_url ? `<img class="thumb" src="${p.image_url}">` : ''}${(p.all_image_urls && p.all_image_urls.split(',').length > 1) ? `<span class="muted" style="margin-left:4px;">+${p.all_image_urls.split(',').length - 1}</span>` : ''}</td>
       <td>${p.product_url ? `<a href="${p.product_url}" target="_blank" style="color:inherit;">${p.title}</a>` : p.title}</td>
       <td class="muted">${p.collection_handle || '—'}</td>
       <td class="muted">${variantLabel}</td>
@@ -137,7 +460,102 @@ async function loadProducts() {
       <td><button class="secondary" onclick="viewHistory(${p.id})">History</button></td>
     </tr>
   `;
-  }).join('') || '<tr><td colspan="9" class="muted">No products yet — add a collection and hit Scrape Now.</td></tr>';
+  }).join('') || `<tr><td colspan="9" class="muted">No products ${collection ? `in "${collection}"` : ''} yet — add a collection, then hit Scrape Now.</td></tr>`;
+}
+
+function statusBadge(status) {
+  if (!status) return `<span class="badge pending">Not scraped yet</span>`;
+  const label = { ok: 'OK', error: 'Error', empty: 'Empty' }[status] || status;
+  return `<span class="badge ${status}">${label}</span>`;
+}
+
+async function loadCollections() {
+  const storeId = currentStoreId();
+  const tbody = document.getElementById('collectionRows');
+  const collSel = document.getElementById('collectionSelect');
+
+  if (!storeId) {
+    tbody.innerHTML = '<tr><td colspan="4" class="muted">No store selected.</td></tr>';
+    collSel.innerHTML = '<option value="">All collections</option>';
+    return [];
+  }
+
+  const collections = await api(`/stores/${storeId}/collections`);
+
+  // Keep the collection dropdown in sync with what's actually tracked for
+  // this store, restoring whichever one was selected last time you were here.
+  const remembered = localStorage.getItem(COLLECTION_STORAGE_PREFIX + storeId) || '';
+  const stillValid = collections.some(c => c.handle === remembered);
+  collSel.innerHTML = '<option value="">All collections</option>' +
+    collections.map(c => `<option value="${c.handle}">${c.handle}</option>`).join('');
+  collSel.value = stillValid ? remembered : '';
+  collSel.onchange = () => { rememberSelectedCollection(); loadProducts(); highlightActiveCollectionRow(); };
+
+  const activeHandle = currentCollectionHandle();
+  const busy = isBusy(storeId);
+  tbody.innerHTML = collections.map(c => `
+    <tr class="${c.handle === activeHandle ? 'active-collection' : ''}">
+      <td>${c.handle}</td>
+      <td>${statusBadge(c.last_scrape_status)}</td>
+      <td class="muted">${c.last_scraped_at ? new Date(c.last_scraped_at).toLocaleString() : '—'}</td>
+      <td>
+        <button class="secondary" onclick="selectCollection('${c.handle}')">View</button>
+        <button class="secondary" ${busy ? 'disabled' : ''} onclick="scrapeOneCollection('${c.handle}')">Scrape</button>
+        <button class="secondary" ${busy ? 'disabled' : ''} onclick="deleteCollection(${c.id}, '${c.handle}')" title="Delete this collection and its tracked products">🗑</button>
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="4" class="muted">No collections yet — add one to start tracking.</td></tr>';
+  return collections;
+}
+
+function selectCollection(handle) {
+  document.getElementById('collectionSelect').value = handle;
+  rememberSelectedCollection();
+  loadProducts();
+  highlightActiveCollectionRow();
+}
+
+function highlightActiveCollectionRow() {
+  const activeHandle = currentCollectionHandle();
+  document.querySelectorAll('#collectionRows tr').forEach(tr => tr.classList.remove('active-collection'));
+  if (!activeHandle) return;
+  document.querySelectorAll('#collectionRows tr').forEach(tr => {
+    if (tr.firstElementChild && tr.firstElementChild.textContent === activeHandle) {
+      tr.classList.add('active-collection');
+    }
+  });
+}
+
+async function scrapeOneCollection(handle) {
+  await triggerScrape(handle);
+}
+
+async function deleteStore() {
+  const id = currentStoreId();
+  if (!id) return;
+  const store = loadedStores.find(s => s.id === id);
+  const name = store ? store.name : 'this store';
+  if (!confirm(`Delete "${name}" and everything tracked under it (collections, products, history)? This can't be undone.`)) return;
+
+  await fetch(`/stores/${id}`, { method: 'DELETE' });
+  localStorage.removeItem(COLLECTION_STORAGE_PREFIX + id);
+  await loadStores();
+}
+
+async function deleteCollection(collectionId, handle) {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  if (!confirm(`Delete collection "${handle}" and its tracked products? This can't be undone.`)) return;
+
+  await fetch(`/stores/${storeId}/collections/${collectionId}`, { method: 'DELETE' });
+
+  // If the deleted collection was the one currently filtered/selected, reset to "All collections".
+  if (currentCollectionHandle() === handle) {
+    document.getElementById('collectionSelect').value = '';
+    rememberSelectedCollection();
+  }
+  await loadCollections();
+  await loadProducts();
 }
 
 async function loadAlerts() {
@@ -146,7 +564,7 @@ async function loadAlerts() {
   if (!alerts.length) { el.innerHTML = 'No changes in the last 24 hours.'; return; }
   el.innerHTML = alerts.map(a => `
     <div style="padding:6px 0; border-bottom:1px solid #1e2129;">
-      <span class="badge ${a.change_type === 'price_drop' ? 'ok' : 'ok'}">${a.change_type.replace('_',' ')}</span>
+      <span class="badge ok">${a.change_type.replace('_',' ')}</span>
       Product #${a.product_id} → $${a.price.toFixed(2)} · ${new Date(a.recorded_at).toLocaleString()}
     </div>
   `).join('');
@@ -156,35 +574,440 @@ function openAddStore() { document.getElementById('storeModalBg').style.display 
 function openAddCollection() { document.getElementById('collectionModalBg').style.display = 'flex'; }
 function closeModal(id) { document.getElementById(id).style.display = 'none'; }
 
+function openShopifySync() {
+  const storeId = currentStoreId();
+  if (!storeId) { setScrapeStatus('error', 'Add a store first.'); return; }
+  const store = loadedStores.find(s => s.id === storeId);
+  document.getElementById('shopifyDomain').value = (store && store.shopify_domain) || '';
+  document.getElementById('shopifyClientId').value = (store && store.shopify_client_id) || '';
+  document.getElementById('shopifyClientSecret').value = ''; // never pre-fill the secret back into the field
+  document.getElementById('apiSyncEnabled').checked = store ? !!store.api_sync_enabled : true;
+  document.getElementById('autoCreateEnabled').checked = store ? !!store.auto_create_enabled : false;
+  document.getElementById('shopifySyncModalBg').style.display = 'flex';
+}
+
+async function submitShopifyConnection() {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  const shopify_domain = document.getElementById('shopifyDomain').value.trim();
+  const shopify_client_id = document.getElementById('shopifyClientId').value.trim();
+  const shopify_client_secret = document.getElementById('shopifyClientSecret').value.trim();
+  const api_sync_enabled = document.getElementById('apiSyncEnabled').checked;
+  const auto_create_enabled = document.getElementById('autoCreateEnabled').checked;
+  if (!shopify_domain || !shopify_client_id || !shopify_client_secret) {
+    setScrapeStatus('error', 'Store domain, Client ID, and Client Secret are all required.');
+    return;
+  }
+  await api(`/stores/${storeId}/shopify-connection`, {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ shopify_domain, shopify_client_id, shopify_client_secret, api_sync_enabled, auto_create_enabled }),
+  });
+  closeModal('shopifySyncModalBg');
+  await loadStores(storeId);
+  setScrapeStatus('success', `✓ Connection saved. Use "Test Sync (5)" or "Sync Now" below when you're ready to sync.`);
+  setTimeout(() => setScrapeStatus(null), 6000);
+}
+
+let syncPollTimer = null;
+let syncProgressPollTimer = null;
+
+async function manualSync(limit) {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  const label = limit ? `first ${limit} products (test)` : 'all tracked products';
+  setScrapeStatus('info', `<span class="spinner"></span> Syncing ${label} to Shopify...`);
+
+  const url = `/stores/${storeId}/sync` + (limit ? `?limit=${limit}` : '');
+  let res;
+  try {
+    res = await api(url, { method: 'POST' });
+  } catch (e) {
+    // e.message is already the real reason (the backend's 409 "already
+    // running" detail, an actual network failure, etc.) -- showing a
+    // hardcoded "server unreachable" here regardless of what really
+    // happened was hiding that, e.g. a routine busy-store 409 looked
+    // identical to a genuine outage.
+    setScrapeStatus('error', e.message);
+    return;
+  }
+  if (res.detail) { setScrapeStatus('error', res.detail); return; }
+
+  markBusy(storeId);
+  pollSyncProgress(storeId);
+  await pollSyncCompletion(storeId, limit);
+}
+
+// Polls the live per-group progress endpoint while a sync is running, so
+// you can see exactly what it's doing (which product, how far through,
+// running counts) instead of just staring at a spinner for however many
+// minutes a full catalog sync takes. Separate from pollSyncCompletion
+// below, which only cares about the final result -- this one renders
+// the in-between state and stops itself once the sync finishes.
+function pollSyncProgress(storeId) {
+  if (syncProgressPollTimer) clearInterval(syncProgressPollTimer);
+  const wrap = document.getElementById('syncProgressWrap');
+  wrap.style.display = 'block';
+  renderSyncProgress({ status: 'running', total_groups: 0, completed_groups: 0, current_handle: null, counts: {} });
+
+  syncProgressPollTimer = setInterval(async () => {
+    let progress;
+    try {
+      progress = await api(`/stores/${storeId}/sync/progress`);
+    } catch (e) {
+      return; // transient fetch hiccup -- just try again next tick
+    }
+    renderSyncProgress(progress);
+    if (progress.status === 'done' || progress.status === 'error') {
+      clearInterval(syncProgressPollTimer);
+      syncProgressPollTimer = null;
+      // Leave the final bar visible for a moment so it doesn't just vanish
+      // the instant it completes -- pollSyncCompletion's own status message
+      // takes over shortly after anyway.
+      setTimeout(() => { wrap.style.display = 'none'; }, 4000);
+    }
+  }, 1200);
+}
+
+function renderSyncProgress(progress) {
+  const total = progress.total_groups || 0;
+  const done = progress.completed_groups || 0;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  document.getElementById('syncProgressFill').style.width = pct + '%';
+
+  const text = document.getElementById('syncProgressText');
+  if (progress.status === 'error') {
+    text.textContent = `Stopped with an error -- check your terminal.`;
+  } else if (progress.status === 'done') {
+    text.textContent = `Done — ${done}/${total} products processed.`;
+  } else if (progress.current_handle) {
+    text.textContent = `Processing "${progress.current_handle}" — ${done}/${total} products`;
+  } else {
+    text.textContent = total ? `Starting — 0/${total} products` : 'Starting…';
+  }
+
+  const c = progress.counts || {};
+  document.getElementById('syncProgressCounts').textContent =
+    `${c.matched || 0} updated · ${c.created || 0} created · ${c.not_found || 0} not found · ${c.errors || 0} errors`;
+}
+
+// Sync runs as a background task on the server (see main.py), since a full
+// catalog sync is hundreds of Shopify API calls and can take minutes --
+// too long to safely hold one HTTP request open for. This polls
+// last_sync_at instead of waiting on that one request.
+//
+// The timeout here is based on STALLED progress, not total elapsed time --
+// a 400-product catalog and a 1200-product catalog take very different
+// amounts of time to finish, and a fixed "give up after N minutes" ceiling
+// either wrongly interrupts a slow-but-healthy large sync, or waits too
+// long on a genuinely stuck small one. Instead: as long as
+// completed_groups (from /sync/progress) keeps advancing, keep waiting
+// indefinitely. Only give up if it hasn't moved for STALL_TIMEOUT_MS --
+// that's the actual signal something's wrong (crashed, deadlocked,
+// killed by a redeploy), not just "it's a big catalog."
+const STALL_TIMEOUT_MS = 4 * 60 * 1000; // no progress movement for 4 minutes = treat as stalled
+
+async function pollSyncCompletion(storeId, limit) {
+  if (syncPollTimer) clearInterval(syncPollTimer);
+  const startedAt = Date.now();
+  let lastProgressCount = -1;
+  let lastProgressChangeAt = Date.now();
+
+  syncPollTimer = setInterval(async () => {
+    let stores, progress;
+    try {
+      [stores, progress] = await Promise.all([
+        api('/stores'),
+        api(`/stores/${storeId}/sync/progress`),
+      ]);
+    } catch (e) {
+      return; // transient fetch hiccup -- just try again on the next tick
+    }
+    loadedStores = stores;
+    const store = stores.find(s => s.id === storeId);
+    const finished = store && store.last_sync_at && new Date(store.last_sync_at).getTime() >= startedAt - 2000;
+
+    // Track whether progress is actually moving.
+    const currentCount = progress && typeof progress.completed_groups === 'number' ? progress.completed_groups : -1;
+    if (currentCount !== lastProgressCount) {
+      lastProgressCount = currentCount;
+      lastProgressChangeAt = Date.now();
+    }
+    const stalled = (Date.now() - lastProgressChangeAt) > STALL_TIMEOUT_MS;
+
+    if (finished || stalled) {
+      clearInterval(syncPollTimer);
+      syncPollTimer = null;
+      if (syncProgressPollTimer) { clearInterval(syncProgressPollTimer); syncProgressPollTimer = null; }
+      document.getElementById('syncProgressWrap').style.display = 'none';
+      markIdle(storeId);
+      await loadProducts();
+
+      if (!finished) {
+        const mins = Math.round((Date.now() - startedAt) / 60000);
+        setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal/Railway logs, it may have crashed. Otherwise it might just still be running server-side; refresh in a bit before re-clicking Sync.`);
+        return;
+      }
+      if (store.last_sync_status === 'error') {
+        setScrapeStatus('error', `Sync finished with errors -- check your terminal and the summary below for details.`);
+      } else {
+        setScrapeStatus('success', limit ? `✓ Test sync complete — check the summary below before running the full sync.` : `✓ Sync complete — check the summary below.`);
+        setTimeout(() => setScrapeStatus(null), 6000);
+      }
+    }
+  }, 3000);
+}
+
+function loadSyncStatus() {
+  const panel = document.getElementById('syncStatusPanel');
+  const storeId = currentStoreId();
+  const store = loadedStores.find(s => s.id === storeId);
+  if (!store) { panel.innerHTML = 'No store selected.'; return; }
+
+  if (!store.shopify_domain) {
+    panel.innerHTML = `Not connected yet. <button class="secondary" onclick="openShopifySync()">Set up Shopify Sync</button>`;
+    return;
+  }
+
+  const statusClass = store.last_sync_status === 'ok' ? 'ok' : (store.last_sync_status === 'error' ? 'error' : 'pending');
+  const lastRun = store.last_sync_at ? new Date(store.last_sync_at).toLocaleString() : 'never run yet';
+  const busy = isBusy(storeId);
+  panel.innerHTML = `
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        Connected to <strong>${store.shopify_domain}</strong>
+        ${store.api_sync_enabled ? '<span class="badge ok">Sync ON</span>' : '<span class="badge pending">Sync OFF</span>'}
+        ${store.auto_create_enabled ? '<span class="badge ok">Auto-create ON</span>' : ''}
+      </div>
+      <div class="row">
+        <button class="secondary" ${busy ? 'disabled' : ''} onclick="openShopifySync()">Edit</button>
+        <button class="secondary" ${busy ? 'disabled' : ''} onclick="manualSync(5)" title="Only syncs the first 5 tracked products — safe way to test a new connection, especially with auto-create on, before running the full catalog">Test Sync (5)</button>
+        <button class="secondary" ${busy ? 'disabled' : ''} onclick="manualSync()">Sync Now</button>
+      </div>
+    </div>
+    <div class="muted" style="margin-top:6px;">
+      Last sync: ${lastRun}${store.last_sync_summary ? ` — ${store.last_sync_summary}` : ''}
+    </div>
+  `;
+}
+
+// Marks a store busy/idle for the UI: disables the buttons that would
+// otherwise race whatever's running (server-side, the real lock is the
+// 409 responses in main.py -- this just keeps the UI from inviting a
+// click it's about to reject). Only touches visible buttons if the busy
+// store is the one currently selected; a background scrape for a store
+// you've since switched away from doesn't lock up the UI for whatever
+// you're looking at now.
+function markBusy(storeId) { busyStores.add(storeId); refreshBusyUI(storeId); }
+function markIdle(storeId) { busyStores.delete(storeId); refreshBusyUI(storeId); }
+function refreshBusyUI(storeId) {
+  if (currentStoreId() !== storeId) return;
+  const busy = isBusy(storeId);
+  document.querySelectorAll('.needs-idle').forEach(el => el.disabled = busy);
+  document.getElementById('scrapeBtn').disabled = busy;
+  document.getElementById('stopScrapeBtn').style.display = busy ? 'inline-block' : 'none';
+  loadCollections();
+  loadSyncStatus();
+}
+
+function setScrapeStatus(kind, html) {
+  const el = document.getElementById('scrapeStatus');
+  if (!kind) { el.style.display = 'none'; return; }
+  el.className = kind;
+  el.style.display = 'flex';
+  el.innerHTML = html;
+}
+
 async function submitStore() {
   const name = document.getElementById('storeName').value.trim();
   const base_url = document.getElementById('storeUrl').value.trim();
-  const currency = document.getElementById('storeCurrency').value.trim() || 'USD';
   if (!name || !base_url) return;
-  await api('/stores', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, base_url, currency}) });
+  const newStore = await api('/stores', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, base_url}) });
+  document.getElementById('storeName').value = '';
+  document.getElementById('storeUrl').value = '';
   closeModal('storeModalBg');
-  await loadStores();
+  await loadStores(newStore.id);
 }
 
 async function submitCollection() {
   const storeId = currentStoreId();
   const handle = document.getElementById('collectionHandle').value.trim();
   if (!storeId || !handle) return;
-  await api(`/stores/${storeId}/collections`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({handle}) });
+  const res = await api(`/stores/${storeId}/collections`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({handle}) });
+  document.getElementById('collectionHandle').value = '';
   closeModal('collectionModalBg');
+
+  if (res.detail) {
+    setScrapeStatus('error', res.detail);
+    return;
+  }
+
+  await loadCollections();
+  triggerScrape();
 }
 
-async function triggerScrape() {
+async function triggerScrape(onlyHandle) {
   const storeId = currentStoreId();
   if (!storeId) return;
-  await api(`/scrape/${storeId}`, { method: 'POST' });
-  alert('Scrape started in the background — refresh in a few seconds.');
-  setTimeout(() => { loadProducts(); loadAlerts(); }, 4000);
+
+  if (pollTimer) clearInterval(pollTimer);
+  setScrapeStatus('info', `<span class="spinner"></span> Scraping ${onlyHandle ? `"${onlyHandle}"` : 'started'} — this can take a little while for larger collections.`);
+
+  const url = `/scrape/${storeId}` + (onlyHandle ? `?collection=${encodeURIComponent(onlyHandle)}` : '');
+  let res;
+  try {
+    res = await api(url, { method: 'POST' });
+  } catch (e) {
+    // See the matching comment in manualSync -- e.message already carries
+    // the real reason, don't paper over it with a hardcoded guess.
+    setScrapeStatus('error', e.message);
+    return;
+  }
+  if (res.detail) { setScrapeStatus('error', res.detail); return; }
+
+  markBusy(storeId);
+  pollScrapeProgress(storeId);
+
+  const startedAt = Date.now();
+  let lastProgressCount = -1;
+  let lastProgressChangeAt = Date.now();
+
+  pollTimer = setInterval(async () => {
+    let collections, progress;
+    try {
+      [collections, progress] = await Promise.all([
+        loadCollections(),
+        api(`/scrape/${storeId}/progress`),
+      ]);
+    } catch (e) {
+      return; // transient fetch hiccup -- just try again next tick
+    }
+
+    const relevant = collections.filter(c => c.active !== false && (!onlyHandle || c.handle === onlyHandle));
+    const allDone = relevant.length > 0 && relevant.every(c =>
+      c.last_scraped_at && new Date(c.last_scraped_at).getTime() >= startedAt - 2000
+    );
+    const stoppedEarly = progress.status === 'cancelled' || progress.status === 'error';
+
+    // Same "give up only if genuinely stalled, not just slow" logic as
+    // sync's pollSyncCompletion -- a big catalog legitimately takes a
+    // while, and that's not the same thing as being stuck.
+    // Uses products_scraped rather than completed_collections: a store
+    // can have very few collections (sometimes just one) with hundreds or
+    // thousands of products in it, and completed_collections wouldn't
+    // budge for the whole scrape even though real progress is happening
+    // the entire time -- products_scraped is the more granular signal.
+    const currentCount = typeof progress.products_scraped === 'number' ? progress.products_scraped : -1;
+    if (currentCount !== lastProgressCount) {
+      lastProgressCount = currentCount;
+      lastProgressChangeAt = Date.now();
+    }
+    const stalled = (Date.now() - lastProgressChangeAt) > STALL_TIMEOUT_MS;
+
+    if (allDone || stoppedEarly || stalled) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      if (scrapeProgressPollTimer) { clearInterval(scrapeProgressPollTimer); scrapeProgressPollTimer = null; }
+      document.getElementById('scrapeProgressWrap').style.display = 'none';
+      markIdle(storeId);
+      await loadProducts();
+      await loadAlerts();
+
+      if (progress.status === 'cancelled') {
+        setScrapeStatus('info', `Stopped — whatever was already scraped before that has been kept.`);
+        setTimeout(() => setScrapeStatus(null), 6000);
+        return;
+      }
+      if (stalled && !allDone) {
+        const mins = Math.round((Date.now() - startedAt) / 60000);
+        setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal, it may have crashed. Otherwise it might still be running server-side; refresh before re-clicking Scrape Now.`);
+        return;
+      }
+      const errored = relevant.filter(c => c.last_scrape_status === 'error');
+      const empty = relevant.filter(c => c.last_scrape_status === 'empty');
+      if (errored.length) {
+        setScrapeStatus('error', `Scrape finished, but ${errored.length} collection(s) failed — check the Collections table above for details.`);
+      } else if (empty.length === relevant.length) {
+        setScrapeStatus('error', `Scrape finished, but found 0 products — double check the collection handle matches the one in the store's URL.`);
+      } else {
+        setScrapeStatus('success', `✓ Scrape complete.`);
+        setTimeout(() => setScrapeStatus(null), 5000);
+      }
+    }
+  }, 2000);
+}
+
+let scrapeProgressPollTimer = null;
+
+// Same idea as pollSyncProgress: shows live "X of Y collections, N products
+// found so far" instead of a blind spinner while a scrape runs.
+function pollScrapeProgress(storeId) {
+  if (scrapeProgressPollTimer) clearInterval(scrapeProgressPollTimer);
+  const wrap = document.getElementById('scrapeProgressWrap');
+  wrap.style.display = 'block';
+  renderScrapeProgress({ status: 'running', total_collections: 0, completed_collections: 0, current_collection: null, products_scraped: 0 });
+
+  scrapeProgressPollTimer = setInterval(async () => {
+    let progress;
+    try {
+      progress = await api(`/scrape/${storeId}/progress`);
+    } catch (e) {
+      return;
+    }
+    renderScrapeProgress(progress);
+    if (progress.status === 'done' || progress.status === 'error' || progress.status === 'cancelled') {
+      clearInterval(scrapeProgressPollTimer);
+      scrapeProgressPollTimer = null;
+      setTimeout(() => { wrap.style.display = 'none'; }, 4000);
+    }
+  }, 1000);
+}
+
+function renderScrapeProgress(progress) {
+  const total = progress.total_collections || 0;
+  const done = progress.completed_collections || 0;
+  const productsSoFar = progress.products_scraped || 0;
+  const fill = document.getElementById('scrapeProgressFill');
+
+  // There's no way to know the TOTAL number of products up front (unlike
+  // sync, which knows its total from the DB before starting) -- a
+  // collection's size isn't known until it's actually been scraped. So
+  // rather than a misleading percentage tied to collection count (which
+  // barely moves when a store has few collections but many products
+  // each), the bar just pulses to show "actively working" while the real
+  // signal -- the live product count -- is the prominent, large text.
+  const isActive = progress.status === 'running' || (!progress.status);
+  fill.classList.toggle('indeterminate', isActive);
+  fill.style.width = isActive ? '100%' : (progress.status === 'done' ? '100%' : (total > 0 ? Math.round((done / total) * 100) + '%' : '0%'));
+
+  const text = document.getElementById('scrapeProgressText');
+  if (progress.status === 'error') {
+    text.textContent = `Stopped with an error -- check your terminal.`;
+  } else if (progress.status === 'cancelled') {
+    text.textContent = `Stopped — ${productsSoFar} products scraped before stopping.`;
+  } else if (progress.status === 'done') {
+    text.textContent = `Done — ${productsSoFar} products scraped across ${total} collection(s).`;
+  } else if (progress.current_collection) {
+    text.textContent = `Scraping "${progress.current_collection}"…`;
+  } else {
+    text.textContent = 'Starting…';
+  }
+
+  // The big, prominent number -- this is the actual "is it doing
+  // something" signal, updated every poll tick as products come in.
+  document.getElementById('scrapeProgressCounts').textContent =
+    total > 1 ? `${productsSoFar} products scraped so far (${done}/${total} collections done)` : `${productsSoFar} products scraped so far`;
+}
+
+async function stopScrape() {
+  const storeId = currentStoreId();
+  if (!storeId) return;
+  await fetch(`/scrape/${storeId}/stop`, { method: 'POST' });
+  setScrapeStatus('info', `<span class="spinner"></span> Stopping — finishing the page it's currently on, then it'll stop.`);
 }
 
 function exportCsv() {
   const storeId = currentStoreId();
-  if (!storeId) { alert('Add a store first.'); return; }
+  if (!storeId) { setScrapeStatus('error', 'Add a store first.'); return; }
   window.location.href = `/export/${storeId}/csv`;
 }
 
@@ -205,7 +1028,9 @@ async function viewHistory(productId) {
 
 loadStores();
 loadAlerts();
+loadTargetCurrency();
 setInterval(loadAlerts, 30000);
+setInterval(loadScheduleStatus, 60000);
 </script>
 </body>
 </html>

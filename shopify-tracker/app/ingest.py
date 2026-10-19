@@ -26,7 +26,7 @@ def classify_change(old_price: float, old_available: bool, new_price: float, new
 
 
 def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> dict:
-    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "collections": []}
+    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "vanished": 0, "collections": []}
     now = datetime.now(timezone.utc)
 
     for result in results:
@@ -50,9 +50,12 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
             summary["errors"] += 1
             continue
 
+        seen_variant_ids = set()
+
         for row in result.products:
             if not row["variant_id"]:
                 continue
+            seen_variant_ids.add(row["variant_id"])
 
             existing = (
                 db.query(Product)
@@ -70,16 +73,21 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
                     product_url=row["product_url"],
                     title=row["title"],
                     vendor=row["vendor"],
+                    product_type=row["product_type"],
                     body_html=row["body_html"],
                     tags=row["tags"],
                     sku=row["sku"],
                     image_url=row["image_url"],
+                    all_image_urls=row["all_image_urls"],
                     price=row["price"],
                     available=row["available"],
                     inventory_qty=row["inventory_qty"],
+                    weight_grams=row["weight_grams"],
                     option1_name=row["option1_name"], option1_value=row["option1_value"],
                     option2_name=row["option2_name"], option2_value=row["option2_value"],
                     option3_name=row["option3_name"], option3_value=row["option3_value"],
+                    detected_colour=row.get("detected_colour"),
+                    piece_count=row.get("piece_count"),
                     first_seen=now,
                     last_seen=now,
                 )
@@ -104,7 +112,18 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
                 existing.body_html = row["body_html"]
                 existing.tags = row["tags"]
                 existing.image_url = row["image_url"]
+                existing.all_image_urls = row["all_image_urls"]
                 existing.inventory_qty = row["inventory_qty"]
+                existing.product_type = row["product_type"]
+                existing.weight_grams = row["weight_grams"]
+                existing.option1_name = row["option1_name"]
+                existing.option1_value = row["option1_value"]
+                existing.option2_name = row["option2_name"]
+                existing.option2_value = row["option2_value"]
+                existing.option3_name = row["option3_name"]
+                existing.option3_value = row["option3_value"]
+                existing.detected_colour = row.get("detected_colour")
+                existing.piece_count = row.get("piece_count")
                 if change:
                     existing.price = row["price"]
                     existing.available = row["available"]
@@ -118,6 +137,43 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
                     summary["updated"] += 1
                 else:
                     summary["unchanged"] += 1
+
+        # Anything previously tracked in this collection but NOT present in
+        # this scrape has genuinely disappeared from the source (permanently
+        # discontinued, removed, etc) rather than just "still there,
+        # unchanged". Mark it out of stock -- same as any other stock
+        # change -- rather than leaving it frozen showing stale "in stock"
+        # data forever. This NEVER deletes the Product row or touches
+        # anything on the destination Shopify store directly: it just
+        # updates available/inventory_qty here, so the next regular sync
+        # naturally pushes the same "sold out" update it would for any
+        # other out-of-stock item -- consistent with the tool never
+        # deleting listings, only ever updating stock status.
+        #
+        # Only runs for a collection that scraped successfully this round
+        # ("ok" or "empty", not "error") -- a failed/timed-out scrape must
+        # never be read as "everything in this collection vanished", which
+        # would wrongly mark a whole collection's worth of real stock as
+        # sold out over a transient network hiccup.
+        vanished_query = db.query(Product).filter(
+            Product.store_id == store_id,
+            Product.collection_handle == result.collection_handle,
+            Product.available == True,  # noqa: E712 -- only touch rows that would actually change
+        )
+        if seen_variant_ids:
+            vanished_query = vanished_query.filter(~Product.variant_id.in_(seen_variant_ids))
+        vanished = vanished_query.all()
+        for product in vanished:
+            product.available = False
+            product.inventory_qty = 0
+            db.add(PriceHistory(
+                product_id=product.id,
+                price=product.price,
+                available=False,
+                change_type="out_of_stock",
+                recorded_at=now,
+            ))
+            summary["vanished"] += 1
 
     db.commit()
     return summary
