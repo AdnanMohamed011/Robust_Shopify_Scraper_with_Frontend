@@ -15,6 +15,7 @@ create it" logic lives in shopify_sync.py.
 import asyncio
 import logging
 import re
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -31,7 +32,8 @@ MAX_ATTEMPTS = 3
 # leaky-bucket limiter) to regularly need more than 3 tries when several
 # are running concurrently.
 THROTTLE_MAX_ATTEMPTS = 6
-BASE_BACKOFF_SECONDS = 2
+BASE_BACKOFF_SECONDS = 3
+MAX_THROTTLE_BACKOFF_SECONDS = 45
 REQUEST_TIMEOUT = 15
 
 
@@ -153,8 +155,13 @@ async def _graphql(
                 if resp.status == 429:
                     if attempt >= THROTTLE_MAX_ATTEMPTS:
                         raise ShopifyAPIError(f"Still rate-limited by Shopify after {attempt} attempts (HTTP 429).")
-                    wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    logger.warning(f"Rate limited by Shopify (429), waiting {wait}s (attempt {attempt}/{THROTTLE_MAX_ATTEMPTS})")
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        wait = float(retry_after) if retry_after else BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    except (TypeError, ValueError):
+                        wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    wait = min(MAX_THROTTLE_BACKOFF_SECONDS, max(1.0, wait)) + random.uniform(0, 1)
+                    logger.warning(f"Rate limited by Shopify (429), waiting {wait:.1f}s (attempt {attempt}/{THROTTLE_MAX_ATTEMPTS})")
                     await asyncio.sleep(wait)
                     continue
 
@@ -175,8 +182,21 @@ async def _graphql(
                     if is_throttled:
                         if attempt >= THROTTLE_MAX_ATTEMPTS:
                             raise ShopifyAPIError(f"Still throttled by Shopify after {attempt} attempts: {errors}")
-                        wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                        logger.warning(f"Throttled by Shopify (GraphQL THROTTLED), waiting {wait}s (attempt {attempt}/{THROTTLE_MAX_ATTEMPTS})")
+                        # Shopify includes cost.throttleStatus in the response extensions;
+                        # use currently available capacity when present, with capped exponential
+                        # backoff + jitter as a safe fallback.
+                        extensions = data.get("extensions") or {}
+                        cost = extensions.get("cost") or {}
+                        throttle = cost.get("throttleStatus") or {}
+                        available = throttle.get("currentlyAvailable")
+                        restore_rate = throttle.get("restoreRate") or 0
+                        requested = (cost.get("requestedQueryCost") or 0)
+                        if available is not None and restore_rate and requested > available:
+                            wait = (requested - available) / restore_rate
+                        else:
+                            wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                        wait = min(MAX_THROTTLE_BACKOFF_SECONDS, max(1.0, wait)) + random.uniform(0, 1)
+                        logger.warning(f"Throttled by Shopify (GraphQL THROTTLED), waiting {wait:.1f}s (attempt {attempt}/{THROTTLE_MAX_ATTEMPTS})")
                         await asyncio.sleep(wait)
                         continue
                     raise ShopifyAPIError(f"Shopify GraphQL error: {errors}")

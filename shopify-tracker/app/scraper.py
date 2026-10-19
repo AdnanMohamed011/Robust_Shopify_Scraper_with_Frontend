@@ -17,6 +17,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import email.utils
 from typing import Optional
 
 import aiohttp
@@ -30,7 +31,7 @@ REQUEST_TIMEOUT = 10
 # getting rate-limited (429) on nearly every collection, nearly every
 # night. These are modest-traffic Pakistani storefronts, not built to
 # absorb request bursts the way a high-traffic site would be.
-MAX_CONCURRENT_REQUESTS = 2
+MAX_CONCURRENT_REQUESTS = 1
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
 # connection failure), so it gets more attempts than MAX_ATTEMPTS and a
@@ -42,7 +43,7 @@ RATE_LIMIT_BACKOFF_SECONDS = 8  # fallback wait when no Retry-After header is pr
 # collection, on top of the concurrency cap above -- cheap extra insurance
 # against a simple "N requests per second" limiter that the concurrency
 # cap alone doesn't fully address.
-PAGE_FETCH_DELAY_SECONDS = 0.4
+PAGE_FETCH_DELAY_SECONDS = 1.0
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -500,10 +501,21 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]
                 # headers, so the site's own requested cooldown (if it
                 # sent one) is used instead of a guess.
                 retry_after = e.headers.get("Retry-After") if e.headers else None
-                try:
-                    wait = float(retry_after) if retry_after is not None else RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
-                except ValueError:
-                    wait = RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
+                wait = RATE_LIMIT_BACKOFF_SECONDS * (2 ** (rate_limit_attempt - 1))
+                if retry_after is not None:
+                    try:
+                        # Retry-After may be a number of seconds or an HTTP date.
+                        wait = max(0.0, float(retry_after))
+                    except (TypeError, ValueError):
+                        try:
+                            retry_at = email.utils.parsedate_to_datetime(retry_after)
+                            if retry_at.tzinfo is None:
+                                retry_at = retry_at.replace(tzinfo=timezone.utc)
+                            wait = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                # Avoid hot-looping if a server sends a malformed or zero delay.
+                wait = max(1.0, wait)
                 logger.warning(
                     f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
                     f"Waiting {wait:.1f}s (Retry-After={retry_after})"

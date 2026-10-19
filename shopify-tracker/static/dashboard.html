@@ -559,15 +559,36 @@ async function deleteCollection(collectionId, handle) {
 }
 
 async function loadAlerts() {
-  const alerts = await api('/alerts?hours=24');
   const el = document.getElementById('alerts');
-  if (!alerts.length) { el.innerHTML = 'No changes in the last 24 hours.'; return; }
-  el.innerHTML = alerts.map(a => `
-    <div style="padding:6px 0; border-bottom:1px solid #1e2129;">
-      <span class="badge ok">${a.change_type.replace('_',' ')}</span>
-      Product #${a.product_id} → $${a.price.toFixed(2)} · ${new Date(a.recorded_at).toLocaleString()}
-    </div>
-  `).join('');
+  if (!el) return;
+  try {
+    const alerts = await api('/alerts?hours=24');
+    if (!Array.isArray(alerts) || alerts.length === 0) {
+      el.textContent = 'No changes in the last 24 hours.';
+      return;
+    }
+    el.innerHTML = alerts.map(a => {
+      const changeType = String(a.change_type || 'change').replaceAll('_', ' ');
+      const price = Number(a.price);
+      const safePrice = Number.isFinite(price) ? price.toFixed(2) : '—';
+      const recorded = a.recorded_at ? new Date(a.recorded_at).toLocaleString() : 'Time unavailable';
+      return `<div style="padding:6px 0; border-bottom:1px solid #1e2129;">
+        <span class="badge ok">${escapeHtml(changeType)}</span>
+        Product #${Number(a.product_id) || '—'} → ${safePrice} · ${escapeHtml(recorded)}
+      </div>`;
+    }).join('');
+  } catch (error) {
+    // Alerts are a secondary panel. A temporary fetch failure should not
+    // throw an unhandled rejection or replace the main scrape/sync status.
+    console.warn('Could not refresh recent alerts:', error);
+    el.textContent = 'Alerts temporarily unavailable. They will retry automatically.';
+  }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
 }
 
 function openAddStore() { document.getElementById('storeModalBg').style.display = 'flex'; }
