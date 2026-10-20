@@ -26,9 +26,11 @@ logger = logging.getLogger("scraper")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 REQUEST_TIMEOUT = 10
-# Keep collection requests strictly sequential: these storefronts can
-# rate-limit even modest bursts, so avoid overlapping collection requests.
-MAX_CONCURRENT_REQUESTS = 1
+# Lowered from 5 -- at concurrency 5, nearly every tracked store was
+# getting rate-limited (429) on nearly every collection, nearly every
+# night. These are modest-traffic Pakistani storefronts, not built to
+# absorb request bursts the way a high-traffic site would be.
+MAX_CONCURRENT_REQUESTS = 2
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
 # connection failure), so it gets more attempts than MAX_ATTEMPTS and a
@@ -40,7 +42,7 @@ RATE_LIMIT_BACKOFF_SECONDS = 8  # fallback wait when no Retry-After header is pr
 # collection, on top of the concurrency cap above -- cheap extra insurance
 # against a simple "N requests per second" limiter that the concurrency
 # cap alone doesn't fully address.
-PAGE_FETCH_DELAY_SECONDS = 1.0
+PAGE_FETCH_DELAY_SECONDS = 0.4
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -304,7 +306,7 @@ def looks_like_size(value: Optional[str]) -> bool:
 class ScrapeResult:
     store_url: str
     collection_handle: str
-    status: str  # "ok", "empty", "partial", "error"
+    status: str  # "ok", "empty", "error"
     products: list = field(default_factory=list)
     error: Optional[str] = None
 
@@ -562,7 +564,7 @@ async def fetch_collection(
                 # while prices scraped here quietly come back in a
                 # different market's numbers, which then compounds with
                 # FX conversion and any margin into a wrong final price.
-                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?page={page}&country={STORE_COUNTRY_HINT}"
+                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}&country={STORE_COUNTRY_HINT}"
                 data = await fetch_page(session, url)
                 page_products = (data or {}).get("products", [])
 
@@ -584,11 +586,7 @@ async def fetch_collection(
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            # If a later page fails (for example, Shopify returns 429), keep
-            # the products already fetched and report a partial result. The
-            # ingestion layer will save these products but must not infer
-            # that unseen products vanished from the collection.
-            status = "partial" if all_products else "error"
+            status = "error"
             error_msg = str(e)
         finally:
             if store_id is not None:
@@ -610,7 +608,12 @@ async def refresh_store_currency(store_url: str, target_currency: str) -> tuple[
     if detection/lookup failed, in which case the caller should just
     leave the store's existing values alone rather than overwrite them
     with nothing."""
-    async with aiohttp.ClientSession(headers={"User-Agent": "product-tracker/1.0"}) as session:
+    async with aiohttp.ClientSession(headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }) as session:
         currency = await detect_store_currency(session, store_url)
         if not currency:
             return None, None
@@ -636,7 +639,12 @@ async def scrape_store(store_url: str, collection_handles: list[str], store_id: 
         _init_scrape_progress(store_id, len(unique_handles))
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    async with aiohttp.ClientSession(headers={"User-Agent": "product-tracker/1.0"}) as session:
+    async with aiohttp.ClientSession(headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }) as session:
         tasks = [
             fetch_collection(session, store_url, handle, semaphore, store_id=store_id)
             for handle in unique_handles

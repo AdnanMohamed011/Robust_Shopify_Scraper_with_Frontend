@@ -465,7 +465,7 @@ async function loadProducts() {
 
 function statusBadge(status) {
   if (!status) return `<span class="badge pending">Not scraped yet</span>`;
-  const label = { ok: 'OK', error: 'Error', empty: 'Empty', partial: 'Partial' }[status] || status;
+  const label = { ok: 'OK', error: 'Error', blocked: 'Rate limited', empty: 'Empty', partial: 'Partial' }[status] || status;
   return `<span class="badge ${status}">${label}</span>`;
 }
 
@@ -922,7 +922,7 @@ async function triggerScrape(onlyHandle) {
         setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal, it may have crashed. Otherwise it might still be running server-side; refresh before re-clicking Scrape Now.`);
         return;
       }
-      const errored = relevant.filter(c => c.last_scrape_status === 'error');
+      const errored = relevant.filter(c => c.last_scrape_status === 'error' || c.last_scrape_status === 'blocked');
       const partial = relevant.filter(c => c.last_scrape_status === 'partial');
       const empty = relevant.filter(c => c.last_scrape_status === 'empty');
       if (errored.length) {

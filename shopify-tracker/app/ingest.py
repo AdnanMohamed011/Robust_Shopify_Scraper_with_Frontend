@@ -26,7 +26,7 @@ def classify_change(old_price: float, old_available: bool, new_price: float, new
 
 
 def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> dict:
-    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "partial": 0, "vanished": 0, "collections": []}
+    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "vanished": 0, "collections": []}
     now = datetime.now(timezone.utc)
 
     for result in results:
@@ -49,11 +49,6 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
         if result.status == "error":
             summary["errors"] += 1
             continue
-        if result.status == "partial":
-            # Save products from pages that succeeded before a later page
-            # failed, but never mark missing products as vanished on an
-            # incomplete collection scan.
-            summary["partial"] += 1
 
         seen_variant_ids = set()
 
@@ -155,12 +150,11 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
         # other out-of-stock item -- consistent with the tool never
         # deleting listings, only ever updating stock status.
         #
-        # Only run disappearance detection after a complete scan. A partial
-        # scan can ingest products from successful pages, but unseen products
-        # may simply be on a page that was blocked or failed.
-        if result.status == "partial":
-            continue
-
+        # Only runs for a collection that scraped successfully this round
+        # ("ok" or "empty", not "error") -- a failed/timed-out scrape must
+        # never be read as "everything in this collection vanished", which
+        # would wrongly mark a whole collection's worth of real stock as
+        # sold out over a transient network hiccup.
         vanished_query = db.query(Product).filter(
             Product.store_id == store_id,
             Product.collection_handle == result.collection_handle,
