@@ -14,6 +14,7 @@ Improvements over the original script:
 """
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -49,6 +50,12 @@ PAGE_FETCH_DELAY_SECONDS = 1.5
 # other request to that host waits too, instead of hammering it while one
 # task sleeps (which keeps renewing the throttle).
 _host_cooldown_until: dict[str, float] = {}
+
+# Optional HTTP(S) proxy for all scraping requests, e.g.
+# http://user:pass@proxy-host:port -- set SCRAPER_PROXY_URL in Railway.
+# Needed when the source store rate-limits/blocks Railway's datacenter IP
+# outright (a 429 that keeps coming back after every Retry-After wait).
+PROXY_URL = os.environ.get("SCRAPER_PROXY_URL") or None
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -452,7 +459,7 @@ async def detect_store_currency(session: aiohttp.ClientSession, store_url: str) 
     gets the store's real Pakistan-market currency no matter where this
     server itself is hosted.
     """
-    url = f"{store_url.rstrip('/')}/cart.json?country={STORE_COUNTRY_HINT}"
+    url = f"{store_url.rstrip('/')}/cart.json"
     try:
         data = await fetch_page(session, url)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -497,7 +504,7 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]
             await asyncio.sleep(remaining)
         attempt += 1
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT), proxy=PROXY_URL) as resp:
                 resp.raise_for_status()
                 return await resp.json()
         except aiohttp.ClientResponseError as e:
@@ -576,7 +583,7 @@ async def fetch_collection(
                 # while prices scraped here quietly come back in a
                 # different market's numbers, which then compounds with
                 # FX conversion and any margin into a wrong final price.
-                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}&country={STORE_COUNTRY_HINT}"
+                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}"
                 data = await fetch_page(session, url)
                 page_products = (data or {}).get("products", [])
 
@@ -622,6 +629,11 @@ async def refresh_store_currency(store_url: str, target_currency: str) -> tuple[
     with nothing."""
     async with aiohttp.ClientSession(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            # Same Shopify Markets override the old ?country=PK query param
+            # did, but as the "localization" cookie the storefront itself
+            # sets -- keeps request URLs plain/cacheable, which is much
+            # less likely to be rate limited than uncached param URLs.
+            "Cookie": f"localization={STORE_COUNTRY_HINT}",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
@@ -653,6 +665,11 @@ async def scrape_store(store_url: str, collection_handles: list[str], store_id: 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     async with aiohttp.ClientSession(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            # Same Shopify Markets override the old ?country=PK query param
+            # did, but as the "localization" cookie the storefront itself
+            # sets -- keeps request URLs plain/cacheable, which is much
+            # less likely to be rate limited than uncached param URLs.
+            "Cookie": f"localization={STORE_COUNTRY_HINT}",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
