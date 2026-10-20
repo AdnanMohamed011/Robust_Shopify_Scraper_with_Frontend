@@ -15,9 +15,11 @@ Improvements over the original script:
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -30,7 +32,7 @@ REQUEST_TIMEOUT = 10
 # getting rate-limited (429) on nearly every collection, nearly every
 # night. These are modest-traffic Pakistani storefronts, not built to
 # absorb request bursts the way a high-traffic site would be.
-MAX_CONCURRENT_REQUESTS = 2
+MAX_CONCURRENT_REQUESTS = 1
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
 # connection failure), so it gets more attempts than MAX_ATTEMPTS and a
@@ -42,7 +44,11 @@ RATE_LIMIT_BACKOFF_SECONDS = 8  # fallback wait when no Retry-After header is pr
 # collection, on top of the concurrency cap above -- cheap extra insurance
 # against a simple "N requests per second" limiter that the concurrency
 # cap alone doesn't fully address.
-PAGE_FETCH_DELAY_SECONDS = 0.4
+PAGE_FETCH_DELAY_SECONDS = 1.5
+# Shared per-host cooldown: when ANY request to a host gets a 429, every
+# other request to that host waits too, instead of hammering it while one
+# task sleeps (which keeps renewing the throttle).
+_host_cooldown_until: dict[str, float] = {}
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -484,7 +490,11 @@ async def fetch_fx_rate(session: aiohttp.ClientSession, from_currency: str, to_c
 async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
     attempt = 0
     rate_limit_attempt = 0
+    host = urlparse(url).netloc
     while True:
+        remaining = _host_cooldown_until.get(host, 0) - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
         attempt += 1
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
@@ -508,7 +518,9 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]
                     f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
                     f"Waiting {wait:.1f}s (Retry-After={retry_after})"
                 )
-                await asyncio.sleep(wait)
+                _host_cooldown_until[host] = max(
+                    _host_cooldown_until.get(host, 0), time.monotonic() + wait
+                )
                 continue
             # Any other HTTP error status falls through to the same
             # generic retry/backoff as a connection error below.
