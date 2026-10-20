@@ -17,7 +17,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-import email.utils
 from typing import Optional
 
 import aiohttp
@@ -27,10 +26,8 @@ logger = logging.getLogger("scraper")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 REQUEST_TIMEOUT = 10
-# Lowered from 5 -- at concurrency 5, nearly every tracked store was
-# getting rate-limited (429) on nearly every collection, nearly every
-# night. These are modest-traffic Pakistani storefronts, not built to
-# absorb request bursts the way a high-traffic site would be.
+# Keep collection requests strictly sequential: these storefronts can
+# rate-limit even modest bursts, so avoid overlapping collection requests.
 MAX_CONCURRENT_REQUESTS = 1
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
@@ -307,7 +304,7 @@ def looks_like_size(value: Optional[str]) -> bool:
 class ScrapeResult:
     store_url: str
     collection_handle: str
-    status: str  # "ok", "empty", "error"
+    status: str  # "ok", "empty", "partial", "error"
     products: list = field(default_factory=list)
     error: Optional[str] = None
 
@@ -501,21 +498,10 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]
                 # headers, so the site's own requested cooldown (if it
                 # sent one) is used instead of a guess.
                 retry_after = e.headers.get("Retry-After") if e.headers else None
-                wait = RATE_LIMIT_BACKOFF_SECONDS * (2 ** (rate_limit_attempt - 1))
-                if retry_after is not None:
-                    try:
-                        # Retry-After may be a number of seconds or an HTTP date.
-                        wait = max(0.0, float(retry_after))
-                    except (TypeError, ValueError):
-                        try:
-                            retry_at = email.utils.parsedate_to_datetime(retry_after)
-                            if retry_at.tzinfo is None:
-                                retry_at = retry_at.replace(tzinfo=timezone.utc)
-                            wait = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
-                        except (TypeError, ValueError, OverflowError):
-                            pass
-                # Avoid hot-looping if a server sends a malformed or zero delay.
-                wait = max(1.0, wait)
+                try:
+                    wait = float(retry_after) if retry_after is not None else RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
+                except ValueError:
+                    wait = RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
                 logger.warning(
                     f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
                     f"Waiting {wait:.1f}s (Retry-After={retry_after})"
@@ -598,7 +584,11 @@ async def fetch_collection(
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            status = "error"
+            # If a later page fails (for example, Shopify returns 429), keep
+            # the products already fetched and report a partial result. The
+            # ingestion layer will save these products but must not infer
+            # that unseen products vanished from the collection.
+            status = "partial" if all_products else "error"
             error_msg = str(e)
         finally:
             if store_id is not None:
