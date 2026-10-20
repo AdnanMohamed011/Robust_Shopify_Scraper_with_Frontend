@@ -367,10 +367,16 @@ async def _create_group(
     db.commit()
 
 
-async def sync_store(db: Session, store_id: int, limit: int | None = None) -> dict:
+async def sync_store(
+    db: Session,
+    store_id: int,
+    limit: int | None = None,
+    collection_handle: str | None = None,
+) -> dict:
     """
-    Pushes every tracked product for this store into the client's own
-    Shopify store:
+    Pushes tracked products for this store into the client's own Shopify store.
+    If collection_handle is supplied, only products in that source collection are synced;
+    otherwise the whole store is synced:
     - Product rows that already have dest_product_id/dest_variant_id from a
       previous sync just get their price/stock pushed (cheap, no search).
     - Product rows with no dest ids yet get looked up by SKU first, in case
@@ -399,7 +405,10 @@ async def sync_store(db: Session, store_id: int, limit: int | None = None) -> di
         db.commit()
         return summary
 
-    products = db.query(Product).filter(Product.store_id == store_id).all()
+    product_query = db.query(Product).filter(Product.store_id == store_id)
+    if collection_handle is not None:
+        product_query = product_query.filter(Product.collection_handle == collection_handle)
+    products = product_query.all()
 
     # Group by product handle, preserving first-seen order, same convention
     # as export.build_shopify_csv -- keeps all variants of one design together.
