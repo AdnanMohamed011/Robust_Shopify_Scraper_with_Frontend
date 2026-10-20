@@ -957,7 +957,7 @@ function pollScrapeProgress(storeId) {
       return;
     }
     renderScrapeProgress(progress);
-    if (progress.status === 'done' || progress.status === 'error' || progress.status === 'cancelled') {
+    if (progress.status === 'done' || progress.status === 'partial' || progress.status === 'error' || progress.status === 'cancelled') {
       clearInterval(scrapeProgressPollTimer);
       scrapeProgressPollTimer = null;
       setTimeout(() => { wrap.style.display = 'none'; }, 4000);
@@ -980,13 +980,15 @@ function renderScrapeProgress(progress) {
   // signal -- the live product count -- is the prominent, large text.
   const isActive = progress.status === 'running' || (!progress.status);
   fill.classList.toggle('indeterminate', isActive);
-  fill.style.width = isActive ? '100%' : (progress.status === 'done' ? '100%' : (total > 0 ? Math.round((done / total) * 100) + '%' : '0%'));
+  fill.style.width = isActive ? '100%' : (progress.status === 'done' || progress.status === 'partial' ? '100%' : (total > 0 ? Math.round((done / total) * 100) + '%' : '0%'));
 
   const text = document.getElementById('scrapeProgressText');
   if (progress.status === 'error') {
     text.textContent = `Stopped with an error -- check your terminal.`;
   } else if (progress.status === 'cancelled') {
     text.textContent = `Stopped — ${productsSoFar} products scraped before stopping.`;
+  } else if (progress.status === 'partial') {
+    text.textContent = `Partially complete — ${productsSoFar} products collected; one or more source collections failed or were rate-limited.`;
   } else if (progress.status === 'done') {
     text.textContent = `Done — ${productsSoFar} products scraped across ${total} collection(s).`;
   } else if (progress.current_collection) {

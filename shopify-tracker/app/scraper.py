@@ -319,7 +319,7 @@ def looks_like_size(value: Optional[str]) -> bool:
 class ScrapeResult:
     store_url: str
     collection_handle: str
-    status: str  # "ok", "empty", "error"
+    status: str  # "ok", "empty", "partial", "blocked", "error"
     products: list = field(default_factory=list)
     error: Optional[str] = None
 
@@ -605,8 +605,16 @@ async def fetch_collection(
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            status = "error"
             error_msg = str(e)
+            # A 429 means the source store is rate-limiting access, not that
+            # the collection is empty. Keep any products already fetched.
+            is_rate_limited = isinstance(e, aiohttp.ClientResponseError) and e.status == 429
+            if all_products:
+                status = "partial"
+            elif is_rate_limited:
+                status = "blocked"
+            else:
+                status = "error"
         finally:
             if store_id is not None:
                 _advance_scrape_progress(store_id, handle)
@@ -681,7 +689,14 @@ async def scrape_store(store_url: str, collection_handles: list[str], store_id: 
         results = await asyncio.gather(*tasks)
 
     if store_id is not None:
-        final_status = "cancelled" if any(r.status == "cancelled" for r in results) else "done"
+        if any(r.status == "cancelled" for r in results):
+            final_status = "cancelled"
+        elif any(r.status in {"error", "blocked"} for r in results):
+            final_status = "error" if not any(r.products for r in results) else "partial"
+        elif any(r.status == "partial" for r in results):
+            final_status = "partial"
+        else:
+            final_status = "done"
         _finish_scrape_progress(store_id, final_status)
 
     return results
