@@ -465,7 +465,7 @@ async function loadProducts() {
 
 function statusBadge(status) {
   if (!status) return `<span class="badge pending">Not scraped yet</span>`;
-  const label = { ok: 'OK', error: 'Error', blocked: 'Retry later', unavailable: 'Temporarily unavailable', empty: 'Empty', partial: 'Partial' }[status] || status;
+  const label = { ok: 'OK', error: 'Error', blocked: 'Rate limited', empty: 'Empty', partial: 'Partial' }[status] || status;
   return `<span class="badge ${status}">${label}</span>`;
 }
 
@@ -868,7 +868,7 @@ async function triggerScrape(onlyHandle) {
   pollScrapeProgress(storeId);
 
   const startedAt = Date.now();
-  let lastProgressCount = -1;
+  let lastProgressCount = '-1:-1'; // "products_scraped:rate_limit_attempt" -- see currentProgressSignal below
   let lastProgressChangeAt = Date.now();
 
   pollTimer = setInterval(async () => {
@@ -896,9 +896,19 @@ async function triggerScrape(onlyHandle) {
     // thousands of products in it, and completed_collections wouldn't
     // budge for the whole scrape even though real progress is happening
     // the entire time -- products_scraped is the more granular signal.
+    //
+    // Also tracks rate_limit_attempt: a page sitting in a 429 backoff
+    // (e.g. mariab.ae asking for repeated 60s Retry-After cooldowns) is
+    // legitimately working and WILL eventually move products_scraped --
+    // it just hasn't yet, because it's still waiting out the site's own
+    // cooldown. Without this, that wait looked identical to a genuinely
+    // crashed process and the "may have crashed" message fired on a scrape
+    // that was actually fine, just patiently retrying as designed.
     const currentCount = typeof progress.products_scraped === 'number' ? progress.products_scraped : -1;
-    if (currentCount !== lastProgressCount) {
-      lastProgressCount = currentCount;
+    const currentRateLimitAttempt = progress.rate_limited ? (progress.rate_limit_attempt ?? 0) : -1;
+    const currentProgressSignal = `${currentCount}:${currentRateLimitAttempt}`;
+    if (currentProgressSignal !== lastProgressCount) {
+      lastProgressCount = currentProgressSignal;
       lastProgressChangeAt = Date.now();
     }
     const stalled = (Date.now() - lastProgressChangeAt) > STALL_TIMEOUT_MS;
@@ -919,18 +929,22 @@ async function triggerScrape(onlyHandle) {
       }
       if (stalled && !allDone) {
         const mins = Math.round((Date.now() - startedAt) / 60000);
-        setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal, it may have crashed. Otherwise it might still be running server-side; refresh before re-clicking Scrape Now.`);
+        if (progress.rate_limited) {
+          setScrapeStatus('error', `Stopped after ${mins} min -- the source site (${progress.current_collection || 'this collection'}) kept rate-limiting every request (attempt ${progress.rate_limit_attempt ?? '?'}/${progress.rate_limit_max_attempts ?? '?'}). This usually isn't a crash -- the site itself is throttling this server hard. It may still be running server-side; refresh before re-clicking Scrape Now, or try again later when the site's limiter has cooled down.`);
+        } else {
+          setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal, it may have crashed. Otherwise it might still be running server-side; refresh before re-clicking Scrape Now.`);
+        }
         return;
       }
-      const errored = relevant.filter(c => c.last_scrape_status === 'error');
-      const partial = relevant.filter(c => c.last_scrape_status === 'partial' || c.last_scrape_status === 'blocked' || c.last_scrape_status === 'unavailable');
+      const errored = relevant.filter(c => c.last_scrape_status === 'error' || c.last_scrape_status === 'blocked');
+      const partial = relevant.filter(c => c.last_scrape_status === 'partial');
       const empty = relevant.filter(c => c.last_scrape_status === 'empty');
       if (errored.length) {
-        setScrapeStatus('info', `Scrape finished with ${errored.length} collection(s) needing attention. Any products already saved were kept.`);
+        setScrapeStatus('error', `Scrape finished, but ${errored.length} collection(s) failed — check the Collections table above for details.`);
       } else if (partial.length) {
-        setScrapeStatus('info', `Scrape finished. ${partial.length} collection(s) were partly retrieved or temporarily blocked; available products were saved and the rest can be retried later.`);
+        setScrapeStatus('info', `Scrape partially completed for ${partial.length} collection(s). Products from successful pages were saved; retry later to fetch the remaining pages.`);
       } else if (empty.length === relevant.length) {
-        setScrapeStatus('info', `Scrape finished, but no products were returned. Check the collection handle or retry later.`);
+        setScrapeStatus('error', `Scrape finished, but found 0 products — double check the collection handle matches the one in the store's URL.`);
       } else {
         setScrapeStatus('success', `✓ Scrape complete.`);
         setTimeout(() => setScrapeStatus(null), 5000);
@@ -989,6 +1003,16 @@ function renderScrapeProgress(progress) {
     text.textContent = `Stopped — ${productsSoFar} products scraped before stopping.`;
   } else if (progress.status === 'done') {
     text.textContent = `Done — ${productsSoFar} products scraped across ${total} collection(s).`;
+  } else if (progress.rate_limited) {
+    // Surfaced from scraper.py's fetch_page via _set_rate_limit_wait --
+    // without this, a page sitting in a 429 cooldown just showed the same
+    // "Scraping ..." text as normal progress, giving no hint that
+    // anything unusual (and possibly very slow) was happening.
+    const resumesAt = progress.rate_limit_resumes_at ? new Date(progress.rate_limit_resumes_at) : null;
+    const secsLeft = resumesAt ? Math.max(0, Math.round((resumesAt.getTime() - Date.now()) / 1000)) : null;
+    text.textContent = `Rate limited by "${progress.current_collection || 'the source site'}" — waiting` +
+      (secsLeft !== null ? ` ${secsLeft}s` : '') +
+      ` before retry (attempt ${progress.rate_limit_attempt ?? '?'}/${progress.rate_limit_max_attempts ?? '?'})`;
   } else if (progress.current_collection) {
     text.textContent = `Scraping "${progress.current_collection}"…`;
   } else {

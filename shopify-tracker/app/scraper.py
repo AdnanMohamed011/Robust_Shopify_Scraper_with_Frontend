@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
@@ -105,6 +105,7 @@ def _init_scrape_progress(store_id: int, total_collections: int) -> None:
         "current_collection": None,
         "products_scraped": 0,
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "rate_limited": False,
     }
     _cancel_requested[store_id] = False
 
@@ -127,6 +128,42 @@ def _advance_scrape_progress(store_id: int, collection_handle: str) -> None:
     if not p:
         return
     p["completed_collections"] += 1
+
+
+def _set_rate_limit_wait(store_id: Optional[int], attempt: int, max_attempts: int, wait_seconds: float) -> None:
+    """Records that this store's scrape is currently sitting in a 429
+    backoff wait, and for how long/which attempt. Without this, a page
+    stuck retrying against a store that keeps 429'ing (e.g. mariab.ae
+    asking for repeated 60s Retry-After cooldowns) looks IDENTICAL from the
+    dashboard's point of view to a genuinely crashed/stuck process --
+    products_scraped doesn't move either way, and the frontend's stall
+    detector (see dashboard.html's STALL_TIMEOUT_MS) was firing a false
+    "may have crashed" warning after 4 minutes even though the scraper was
+    working exactly as designed, just legitimately waiting out the site's
+    own requested cooldown. Exposed via get_scrape_progress so the
+    frontend can tell "waiting on a 429" apart from "stuck" and reset its
+    own stall timer accordingly instead of treating them the same."""
+    if store_id is None:
+        return
+    p = _scrape_progress.get(store_id)
+    if not p:
+        return
+    p["rate_limited"] = True
+    p["rate_limit_attempt"] = attempt
+    p["rate_limit_max_attempts"] = max_attempts
+    p["rate_limit_wait_seconds"] = wait_seconds
+    p["rate_limit_resumes_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+    ).isoformat()
+
+
+def _clear_rate_limit_wait(store_id: Optional[int]) -> None:
+    if store_id is None:
+        return
+    p = _scrape_progress.get(store_id)
+    if not p:
+        return
+    p["rate_limited"] = False
 
 
 def _finish_scrape_progress(store_id: int, status: str) -> None:
@@ -497,52 +534,66 @@ async def fetch_fx_rate(session: aiohttp.ClientSession, from_currency: str, to_c
     return float(rate) if rate is not None else None
 
 
-async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
+async def fetch_page(session: aiohttp.ClientSession, url: str, store_id: Optional[int] = None) -> Optional[dict]:
+    """store_id is optional (fetch_fx_rate/detect_store_currency call this
+    with no store context) and is used only to surface live rate-limit-wait
+    state via _set_rate_limit_wait, so the dashboard can tell "waiting out
+    a 429" apart from "actually stuck" -- see that function's docstring."""
     attempt = 0
     rate_limit_attempt = 0
-    while True:
-        attempt += 1
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-        except aiohttp.ClientResponseError as e:
-            if e.status == 429:
-                rate_limit_attempt += 1
-                if rate_limit_attempt > MAX_RATE_LIMIT_ATTEMPTS:
-                    logger.error(f"Giving up on {url} after {MAX_RATE_LIMIT_ATTEMPTS} rate-limited (429) attempts")
+    try:
+        while True:
+            attempt += 1
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                    resp.raise_for_status()
+                    return await resp.json()
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    rate_limit_attempt += 1
+                    if rate_limit_attempt > MAX_RATE_LIMIT_ATTEMPTS:
+                        logger.error(f"Giving up on {url} after {MAX_RATE_LIMIT_ATTEMPTS} rate-limited (429) attempts")
+                        raise
+                    # aiohttp's ClientResponseError carries the response's own
+                    # headers, so the site's own requested cooldown (if it
+                    # sent one) is used instead of a guess.
+                    retry_after = e.headers.get("Retry-After") if e.headers else None
+                    try:
+                        wait = float(retry_after) if retry_after is not None else RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
+                    except ValueError:
+                        wait = RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
+                    logger.warning(
+                        f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
+                        f"Waiting {wait:.1f}s (Retry-After={retry_after})"
+                    )
+                    _set_rate_limit_wait(store_id, rate_limit_attempt, MAX_RATE_LIMIT_ATTEMPTS, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                # Any other HTTP error status falls through to the same
+                # generic retry/backoff as a connection error below.
+                if attempt < MAX_ATTEMPTS:
+                    wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(f"Attempt {attempt}/{MAX_ATTEMPTS} failed for {url}: {e}. Retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Giving up on {url} after {MAX_ATTEMPTS} attempts: {e}")
                     raise
-                # aiohttp's ClientResponseError carries the response's own
-                # headers, so the site's own requested cooldown (if it
-                # sent one) is used instead of a guess.
-                retry_after = e.headers.get("Retry-After") if e.headers else None
-                try:
-                    wait = float(retry_after) if retry_after is not None else RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
-                except ValueError:
-                    wait = RATE_LIMIT_BACKOFF_SECONDS * rate_limit_attempt
-                logger.warning(
-                    f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
-                    f"Waiting {wait:.1f}s (Retry-After={retry_after})"
-                )
-                await asyncio.sleep(wait)
-                continue
-            # Any other HTTP error status falls through to the same
-            # generic retry/backoff as a connection error below.
-            if attempt < MAX_ATTEMPTS:
-                wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(f"Attempt {attempt}/{MAX_ATTEMPTS} failed for {url}: {e}. Retrying in {wait}s")
-                await asyncio.sleep(wait)
-            else:
-                logger.error(f"Giving up on {url} after {MAX_ATTEMPTS} attempts: {e}")
-                raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt < MAX_ATTEMPTS:
-                wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(f"Attempt {attempt}/{MAX_ATTEMPTS} failed for {url}: {e}. Retrying in {wait}s")
-                await asyncio.sleep(wait)
-            else:
-                logger.error(f"Giving up on {url} after {MAX_ATTEMPTS} attempts: {e}")
-                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < MAX_ATTEMPTS:
+                    wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(f"Attempt {attempt}/{MAX_ATTEMPTS} failed for {url}: {e}. Retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Giving up on {url} after {MAX_ATTEMPTS} attempts: {e}")
+                    raise
+    finally:
+        # Clear the rate-limit-wait flag no matter how this call ends --
+        # success, giving up after MAX_RATE_LIMIT_ATTEMPTS, or any other
+        # error. Without this, a store that was mid-429-wait and then
+        # succeeded (or the whole scrape got cancelled/errored out around
+        # it) would leave "rate_limited": true stuck showing on the
+        # dashboard forever, long after it stopped being true.
+        _clear_rate_limit_wait(store_id)
 
 
 async def fetch_collection(
@@ -581,7 +632,7 @@ async def fetch_collection(
                 # different market's numbers, which then compounds with
                 # FX conversion and any margin into a wrong final price.
                 url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}&country={STORE_COUNTRY_HINT}"
-                data = await fetch_page(session, url)
+                data = await fetch_page(session, url, store_id=store_id)
                 page_products = (data or {}).get("products", [])
 
                 if not page_products:
