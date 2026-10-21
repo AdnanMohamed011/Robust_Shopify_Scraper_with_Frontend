@@ -64,10 +64,6 @@ STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-mark
 # the reasoning (fine for a single-process deployment; a running scrape
 # isn't something that needs to survive a restart anyway).
 # ---------------------------------------------------------------------------
-class ScrapeCancelled(Exception):
-    """Raised when a user requests cancellation during a rate-limit wait."""
-
-
 _scrape_progress: dict[int, dict] = {}
 _cancel_requested: dict[int, bool] = {}
 
@@ -98,57 +94,14 @@ def _is_cancelled(store_id: int) -> bool:
     return _cancel_requested.get(store_id, False)
 
 
-def _touch_scrape_progress(
-    store_id: Optional[int],
-    collection_handle: Optional[str] = None,
-    *,
-    phase: str = "working",
-    message: Optional[str] = None,
-    retry_in_seconds: Optional[float] = None,
-) -> None:
-    """Record live activity even while waiting for a source store's cooldown."""
-    if store_id is None:
-        return
-    p = _scrape_progress.get(store_id)
-    if not p:
-        return
-    if collection_handle is not None:
-        p["current_collection"] = collection_handle
-    p["phase"] = phase
-    p["message"] = message or phase.replace("_", " ").capitalize()
-    p["retry_in_seconds"] = retry_in_seconds
-    p["last_activity_at"] = datetime.now(timezone.utc).isoformat()
-
-
-async def _sleep_with_progress(
-    seconds: float, store_id: Optional[int], collection_handle: Optional[str],
-    *, phase: str, message: str,
-) -> None:
-    """Sleep in short intervals so the dashboard knows a long cooldown is active."""
-    remaining = max(0.0, float(seconds))
-    while remaining > 0:
-        if store_id is not None and _is_cancelled(store_id):
-            return
-        chunk = min(5.0, remaining)
-        _touch_scrape_progress(store_id, collection_handle, phase=phase, message=message, retry_in_seconds=remaining)
-        await asyncio.sleep(chunk)
-        remaining -= chunk
-    _touch_scrape_progress(store_id, collection_handle, phase="fetching_page", message="Retrying request", retry_in_seconds=0)
-
-
 def _init_scrape_progress(store_id: int, total_collections: int) -> None:
-    now = datetime.now(timezone.utc).isoformat()
     _scrape_progress[store_id] = {
         "status": "running",
-        "phase": "starting",
-        "message": "Starting scrape",
-        "retry_in_seconds": None,
-        "last_activity_at": now,
         "total_collections": total_collections,
         "completed_collections": 0,
         "current_collection": None,
         "products_scraped": 0,
-        "started_at": now,
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
     _cancel_requested[store_id] = False
 
@@ -158,10 +111,6 @@ def _update_scrape_progress(store_id: int, collection_handle: str, products_so_f
     if not p:
         return
     p["current_collection"] = collection_handle
-    p["phase"] = "processing_products"
-    p["message"] = f"Processed {products_so_far_in_collection} products in {collection_handle}"
-    p["retry_in_seconds"] = None
-    p["last_activity_at"] = datetime.now(timezone.utc).isoformat()
     # "products_scraped" is a running total across every collection in this
     # scrape, not just the current one -- rebuilt from each collection's own
     # count each time one of them reports progress.
@@ -175,20 +124,12 @@ def _advance_scrape_progress(store_id: int, collection_handle: str) -> None:
     if not p:
         return
     p["completed_collections"] += 1
-    p["last_activity_at"] = datetime.now(timezone.utc).isoformat()
-    p["phase"] = "processing_collections"
-    p["message"] = f"Completed {p['completed_collections']} of {p['total_collections']} collections"
-    p["retry_in_seconds"] = None
 
 
 def _finish_scrape_progress(store_id: int, status: str) -> None:
     p = _scrape_progress.get(store_id)
     if p:
         p["status"] = status
-        p["phase"] = status
-        p["message"] = "Scrape finished" if status == "done" else f"Scrape {status}"
-        p["retry_in_seconds"] = None
-        p["last_activity_at"] = datetime.now(timezone.utc).isoformat()
         p["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 # Clothing stores like Maria B / Gul Ahmed usually bake colour and
@@ -553,23 +494,14 @@ async def fetch_fx_rate(session: aiohttp.ClientSession, from_currency: str, to_c
     return float(rate) if rate is not None else None
 
 
-async def fetch_page(
-    session: aiohttp.ClientSession, url: str,
-    store_id: Optional[int] = None, collection_handle: Optional[str] = None,
-) -> Optional[dict]:
+async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
     attempt = 0
     rate_limit_attempt = 0
     host = urlparse(url).netloc
     while True:
         remaining = _host_cooldown_until.get(host, 0) - time.monotonic()
         if remaining > 0:
-            await _sleep_with_progress(
-                remaining, store_id, collection_handle, phase="rate_limited_wait",
-                message=f"Waiting for {host} rate limit cooldown",
-            )
-            if store_id is not None and _is_cancelled(store_id):
-                raise ScrapeCancelled("Scrape stopped during rate-limit cooldown")
-        _touch_scrape_progress(store_id, collection_handle, phase="fetching_page", message=f"Requesting {host}")
+            await asyncio.sleep(remaining)
         attempt += 1
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT), proxy=PROXY_URL) as resp:
@@ -595,11 +527,6 @@ async def fetch_page(
                 )
                 _host_cooldown_until[host] = max(
                     _host_cooldown_until.get(host, 0), time.monotonic() + wait
-                )
-                _touch_scrape_progress(
-                    store_id, collection_handle, phase="rate_limited_wait",
-                    message=f"{host} rate-limited this request; waiting {wait:.0f}s before retry",
-                    retry_in_seconds=wait,
                 )
                 continue
             # Any other HTTP error status falls through to the same
@@ -657,7 +584,7 @@ async def fetch_collection(
                 # different market's numbers, which then compounds with
                 # FX conversion and any margin into a wrong final price.
                 url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}"
-                data = await fetch_page(session, url, store_id=store_id, collection_handle=handle)
+                data = await fetch_page(session, url)
                 page_products = (data or {}).get("products", [])
 
                 if not page_products:
@@ -677,18 +604,19 @@ async def fetch_collection(
                 # nearly every night, at the old concurrency/pacing.
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
-        except ScrapeCancelled as e:
-            status = "cancelled"
-            error_msg = str(e)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            error_msg = str(e)
-            is_rate_limited = isinstance(e, aiohttp.ClientResponseError) and e.status == 429
+            # Public storefronts may block or throttle requests. Treat that as
+            # a recoverable collection outcome, not a fatal scrape error. Keep
+            # anything already fetched and never imply missing pages are gone.
             if all_products:
                 status = "partial"
-            elif is_rate_limited:
+            elif isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
                 status = "blocked"
             else:
-                status = "error"
+                status = "unavailable"
+            error_msg = str(e)
+            logger.warning("Collection %s on %s ended with status=%s after %s products: %s",
+                           handle, store_url, status, len(all_products), e)
         finally:
             if store_id is not None:
                 _advance_scrape_progress(store_id, handle)
@@ -763,12 +691,7 @@ async def scrape_store(store_url: str, collection_handles: list[str], store_id: 
         results = await asyncio.gather(*tasks)
 
     if store_id is not None:
-        if any(r.status == "cancelled" for r in results):
-            final_status = "cancelled"
-        elif any(r.status in {"partial", "blocked", "error"} for r in results):
-            final_status = "partial"
-        else:
-            final_status = "done"
+        final_status = "cancelled" if any(r.status == "cancelled" for r in results) else "done"
         _finish_scrape_progress(store_id, final_status)
 
     return results

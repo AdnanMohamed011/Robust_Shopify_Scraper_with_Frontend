@@ -465,7 +465,7 @@ async function loadProducts() {
 
 function statusBadge(status) {
   if (!status) return `<span class="badge pending">Not scraped yet</span>`;
-  const label = { ok: 'OK', error: 'Error', blocked: 'Rate limited', empty: 'Empty', partial: 'Partial' }[status] || status;
+  const label = { ok: 'OK', error: 'Error', blocked: 'Retry later', unavailable: 'Temporarily unavailable', empty: 'Empty', partial: 'Partial' }[status] || status;
   return `<span class="badge ${status}">${label}</span>`;
 }
 
@@ -869,7 +869,6 @@ async function triggerScrape(onlyHandle) {
 
   const startedAt = Date.now();
   let lastProgressCount = -1;
-  let lastActivityStamp = '';
   let lastProgressChangeAt = Date.now();
 
   pollTimer = setInterval(async () => {
@@ -898,10 +897,8 @@ async function triggerScrape(onlyHandle) {
     // budge for the whole scrape even though real progress is happening
     // the entire time -- products_scraped is the more granular signal.
     const currentCount = typeof progress.products_scraped === 'number' ? progress.products_scraped : -1;
-    const activityStamp = progress.last_activity_at || '';
-    if (currentCount !== lastProgressCount || activityStamp !== lastActivityStamp) {
+    if (currentCount !== lastProgressCount) {
       lastProgressCount = currentCount;
-      lastActivityStamp = activityStamp;
       lastProgressChangeAt = Date.now();
     }
     const stalled = (Date.now() - lastProgressChangeAt) > STALL_TIMEOUT_MS;
@@ -925,15 +922,15 @@ async function triggerScrape(onlyHandle) {
         setScrapeStatus('error', `No progress for ${Math.round(STALL_TIMEOUT_MS / 60000)} minutes (stopped after ${mins} min total) -- check your terminal, it may have crashed. Otherwise it might still be running server-side; refresh before re-clicking Scrape Now.`);
         return;
       }
-      const errored = relevant.filter(c => c.last_scrape_status === 'error' || c.last_scrape_status === 'blocked');
-      const partial = relevant.filter(c => c.last_scrape_status === 'partial');
+      const errored = relevant.filter(c => c.last_scrape_status === 'error');
+      const partial = relevant.filter(c => c.last_scrape_status === 'partial' || c.last_scrape_status === 'blocked' || c.last_scrape_status === 'unavailable');
       const empty = relevant.filter(c => c.last_scrape_status === 'empty');
       if (errored.length) {
-        setScrapeStatus('error', `Scrape finished, but ${errored.length} collection(s) failed — check the Collections table above for details.`);
+        setScrapeStatus('info', `Scrape finished with ${errored.length} collection(s) needing attention. Any products already saved were kept.`);
       } else if (partial.length) {
-        setScrapeStatus('info', `Scrape partially completed for ${partial.length} collection(s). Products from successful pages were saved; retry later to fetch the remaining pages.`);
+        setScrapeStatus('info', `Scrape finished. ${partial.length} collection(s) were partly retrieved or temporarily blocked; available products were saved and the rest can be retried later.`);
       } else if (empty.length === relevant.length) {
-        setScrapeStatus('error', `Scrape finished, but found 0 products — double check the collection handle matches the one in the store's URL.`);
+        setScrapeStatus('info', `Scrape finished, but no products were returned. Check the collection handle or retry later.`);
       } else {
         setScrapeStatus('success', `✓ Scrape complete.`);
         setTimeout(() => setScrapeStatus(null), 5000);
@@ -960,7 +957,7 @@ function pollScrapeProgress(storeId) {
       return;
     }
     renderScrapeProgress(progress);
-    if (progress.status === 'done' || progress.status === 'partial' || progress.status === 'error' || progress.status === 'cancelled') {
+    if (progress.status === 'done' || progress.status === 'error' || progress.status === 'cancelled') {
       clearInterval(scrapeProgressPollTimer);
       scrapeProgressPollTimer = null;
       setTimeout(() => { wrap.style.display = 'none'; }, 4000);
@@ -988,17 +985,10 @@ function renderScrapeProgress(progress) {
   const text = document.getElementById('scrapeProgressText');
   if (progress.status === 'error') {
     text.textContent = `Stopped with an error -- check your terminal.`;
-  } else if (progress.status === 'partial') {
-    text.textContent = `Partially complete — ${productsSoFar} products scraped; some collections were rate-limited.`;
   } else if (progress.status === 'cancelled') {
     text.textContent = `Stopped — ${productsSoFar} products scraped before stopping.`;
   } else if (progress.status === 'done') {
     text.textContent = `Done — ${productsSoFar} products scraped across ${total} collection(s).`;
-  } else if (progress.phase === 'rate_limited_wait') {
-    const wait = typeof progress.retry_in_seconds === 'number' ? ` (${Math.ceil(progress.retry_in_seconds)}s)` : '';
-    text.textContent = `${progress.message || 'Waiting for store rate limit'}${wait}`;
-  } else if (progress.message) {
-    text.textContent = progress.message;
   } else if (progress.current_collection) {
     text.textContent = `Scraping "${progress.current_collection}"…`;
   } else {

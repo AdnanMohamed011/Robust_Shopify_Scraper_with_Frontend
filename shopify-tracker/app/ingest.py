@@ -46,8 +46,13 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
             "error": result.error,
         })
 
-        if result.status in {"error", "blocked"}:
-            summary["errors"] += 1
+        # A blocked/unavailable collection with no products is a skipped
+        # attempt, not a fatal ingest error. Partial results are still useful:
+        # ingest the rows we got, but never reconcile unseen products as gone
+        # unless the collection was fully fetched (ok/empty).
+        if result.status in ("error", "blocked", "unavailable") and not result.products:
+            if result.status == "error":
+                summary["errors"] += 1
             continue
 
         seen_variant_ids = set()
@@ -138,12 +143,6 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
                 else:
                     summary["unchanged"] += 1
 
-        # Partial results can safely update products actually seen, but they
-        # cannot prove that missing products disappeared. Never mark unseen
-        # variants out of stock unless the entire collection scrape succeeded.
-        if result.status in {"partial", "cancelled"}:
-            continue
-
         # Anything previously tracked in this collection but NOT present in
         # this scrape has genuinely disappeared from the source (permanently
         # discontinued, removed, etc) rather than just "still there,
@@ -161,6 +160,11 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
         # never be read as "everything in this collection vanished", which
         # would wrongly mark a whole collection's worth of real stock as
         # sold out over a transient network hiccup.
+        if result.status not in ("ok", "empty"):
+            # Partial/blocked pages are not a complete inventory snapshot.
+            # Preserve previously tracked stock state and retry on a later run.
+            continue
+
         vanished_query = db.query(Product).filter(
             Product.store_id == store_id,
             Product.collection_handle == result.collection_handle,
