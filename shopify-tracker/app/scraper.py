@@ -14,13 +14,10 @@ Improvements over the original script:
 """
 import asyncio
 import logging
-import os
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlparse
 
 import aiohttp
 
@@ -29,33 +26,39 @@ logger = logging.getLogger("scraper")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 REQUEST_TIMEOUT = 10
-# Lowered from 5 -- at concurrency 5, nearly every tracked store was
-# getting rate-limited (429) on nearly every collection, nearly every
-# night. These are modest-traffic Pakistani storefronts, not built to
-# absorb request bursts the way a high-traffic site would be.
+# Lowered from 5, then from 2 -- even at concurrency 2, stores like Maria B
+# (mariab.ae) were still getting 429'd (seen live in Railway logs: repeated
+# "Rate limited (429) ... Waiting 60.0s (Retry-After=60)" against the same
+# collection). A collection that exhausts its rate-limit retries ends the
+# scrape as status="error" for that collection -- ingest.py correctly
+# refuses to treat an errored collection as "everything vanished" (so it
+# doesn't wrongly blank out real stock), but that also means whatever stock
+# data is already in the DB for it just goes stale instead of refreshing.
+# That's a real-money bug, not just a noisy log: a product can sell out on
+# the source site and this tracker never finds out, so it keeps telling the
+# client's own Shopify store the item is still available -- i.e. exactly
+# the mechanism behind an oversold order. Going to 1 (fully sequential
+# requests, no concurrency at all) trades scrape speed for not feeding
+# stale availability downstream.
 MAX_CONCURRENT_REQUESTS = 1
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
 # connection failure), so it gets more attempts than MAX_ATTEMPTS and a
 # backoff that honors the site's own Retry-After header when it sends one
 # (most do) instead of guessing with the same short backoff as everything else.
-MAX_RATE_LIMIT_ATTEMPTS = 2
+# Raised from 6 -- a store that keeps asking for a 60s cooldown via
+# Retry-After can burn through 6 attempts (6 minutes of waiting) and still
+# not have cooled down. Worth waiting longer in a background job rather
+# than giving up and leaving that collection's stock stale.
+MAX_RATE_LIMIT_ATTEMPTS = 10
 RATE_LIMIT_BACKOFF_SECONDS = 8  # fallback wait when no Retry-After header is present
 # Small fixed pacing delay between consecutive page requests to the SAME
 # collection, on top of the concurrency cap above -- cheap extra insurance
 # against a simple "N requests per second" limiter that the concurrency
-# cap alone doesn't fully address.
-PAGE_FETCH_DELAY_SECONDS = 1.5
-# Shared per-host cooldown: when ANY request to a host gets a 429, every
-# other request to that host waits too, instead of hammering it while one
-# task sleeps (which keeps renewing the throttle).
-_host_cooldown_until: dict[str, float] = {}
-
-# Optional HTTP(S) proxy for all scraping requests, e.g.
-# http://user:pass@proxy-host:port -- set SCRAPER_PROXY_URL in Railway.
-# Needed when the source store rate-limits/blocks Railway's datacenter IP
-# outright (a 429 that keeps coming back after every Retry-After wait).
-PROXY_URL = os.environ.get("SCRAPER_PROXY_URL") or None
+# cap alone doesn't fully address. Raised from 0.4 alongside the
+# concurrency drop above, same reasoning: these are modest-traffic
+# storefronts that are still getting rate-limited at the previous pacing.
+PAGE_FETCH_DELAY_SECONDS = 1.0
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -459,7 +462,7 @@ async def detect_store_currency(session: aiohttp.ClientSession, store_url: str) 
     gets the store's real Pakistan-market currency no matter where this
     server itself is hosted.
     """
-    url = f"{store_url.rstrip('/')}/cart.json"
+    url = f"{store_url.rstrip('/')}/cart.json?country={STORE_COUNTRY_HINT}"
     try:
         data = await fetch_page(session, url)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -497,14 +500,10 @@ async def fetch_fx_rate(session: aiohttp.ClientSession, from_currency: str, to_c
 async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
     attempt = 0
     rate_limit_attempt = 0
-    host = urlparse(url).netloc
     while True:
-        remaining = _host_cooldown_until.get(host, 0) - time.monotonic()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
         attempt += 1
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT), proxy=PROXY_URL) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                 resp.raise_for_status()
                 return await resp.json()
         except aiohttp.ClientResponseError as e:
@@ -525,9 +524,7 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> Optional[dict]
                     f"Rate limited (429) on {url}, attempt {rate_limit_attempt}/{MAX_RATE_LIMIT_ATTEMPTS}. "
                     f"Waiting {wait:.1f}s (Retry-After={retry_after})"
                 )
-                _host_cooldown_until[host] = max(
-                    _host_cooldown_until.get(host, 0), time.monotonic() + wait
-                )
+                await asyncio.sleep(wait)
                 continue
             # Any other HTTP error status falls through to the same
             # generic retry/backoff as a connection error below.
@@ -583,7 +580,7 @@ async def fetch_collection(
                 # while prices scraped here quietly come back in a
                 # different market's numbers, which then compounds with
                 # FX conversion and any margin into a wrong final price.
-                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}"
+                url = f"{store_url.rstrip('/')}/collections/{handle}/products.json?limit=250&page={page}&country={STORE_COUNTRY_HINT}"
                 data = await fetch_page(session, url)
                 page_products = (data or {}).get("products", [])
 
@@ -605,18 +602,8 @@ async def fetch_collection(
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            # Public storefronts may block or throttle requests. Treat that as
-            # a recoverable collection outcome, not a fatal scrape error. Keep
-            # anything already fetched and never imply missing pages are gone.
-            if all_products:
-                status = "partial"
-            elif isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
-                status = "blocked"
-            else:
-                status = "unavailable"
+            status = "error"
             error_msg = str(e)
-            logger.warning("Collection %s on %s ended with status=%s after %s products: %s",
-                           handle, store_url, status, len(all_products), e)
         finally:
             if store_id is not None:
                 _advance_scrape_progress(store_id, handle)
@@ -639,11 +626,6 @@ async def refresh_store_currency(store_url: str, target_currency: str) -> tuple[
     with nothing."""
     async with aiohttp.ClientSession(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            # Same Shopify Markets override the old ?country=PK query param
-            # did, but as the "localization" cookie the storefront itself
-            # sets -- keeps request URLs plain/cacheable, which is much
-            # less likely to be rate limited than uncached param URLs.
-            "Cookie": f"localization={STORE_COUNTRY_HINT}",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
@@ -675,11 +657,6 @@ async def scrape_store(store_url: str, collection_handles: list[str], store_id: 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     async with aiohttp.ClientSession(headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            # Same Shopify Markets override the old ?country=PK query param
-            # did, but as the "localization" cookie the storefront itself
-            # sets -- keeps request URLs plain/cacheable, which is much
-            # less likely to be rate limited than uncached param URLs.
-            "Cookie": f"localization={STORE_COUNTRY_HINT}",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
