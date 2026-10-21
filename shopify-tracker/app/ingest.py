@@ -46,15 +46,9 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
             "error": result.error,
         })
 
-        # Failed or blocked collections have no complete snapshot; do not
-        # mark their previously tracked products as vanished. Partial results
-        # can still update rows fetched before a rate limit, but are counted
-        # as errors and must not trigger vanished-product reconciliation.
         if result.status in {"error", "blocked"}:
             summary["errors"] += 1
             continue
-        if result.status == "partial":
-            summary["errors"] += 1
 
         seen_variant_ids = set()
 
@@ -144,6 +138,12 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
                 else:
                     summary["unchanged"] += 1
 
+        # Partial results can safely update products actually seen, but they
+        # cannot prove that missing products disappeared. Never mark unseen
+        # variants out of stock unless the entire collection scrape succeeded.
+        if result.status in {"partial", "cancelled"}:
+            continue
+
         # Anything previously tracked in this collection but NOT present in
         # this scrape has genuinely disappeared from the source (permanently
         # discontinued, removed, etc) rather than just "still there,
@@ -161,28 +161,25 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
         # never be read as "everything in this collection vanished", which
         # would wrongly mark a whole collection's worth of real stock as
         # sold out over a transient network hiccup.
-        # Only a complete successful snapshot may mark missing products out
-        # of stock. Partial snapshots are incomplete by definition.
-        if result.status in {"ok", "empty"}:
-            vanished_query = db.query(Product).filter(
-                Product.store_id == store_id,
-                Product.collection_handle == result.collection_handle,
-                Product.available == True,  # noqa: E712
-            )
-            if seen_variant_ids:
-                vanished_query = vanished_query.filter(~Product.variant_id.in_(seen_variant_ids))
-            vanished = vanished_query.all()
-            for product in vanished:
-                product.available = False
-                product.inventory_qty = 0
-                db.add(PriceHistory(
-                    product_id=product.id,
-                    price=product.price,
-                    available=False,
-                    change_type="out_of_stock",
-                    recorded_at=now,
-                ))
-                summary["vanished"] += 1
+        vanished_query = db.query(Product).filter(
+            Product.store_id == store_id,
+            Product.collection_handle == result.collection_handle,
+            Product.available == True,  # noqa: E712 -- only touch rows that would actually change
+        )
+        if seen_variant_ids:
+            vanished_query = vanished_query.filter(~Product.variant_id.in_(seen_variant_ids))
+        vanished = vanished_query.all()
+        for product in vanished:
+            product.available = False
+            product.inventory_qty = 0
+            db.add(PriceHistory(
+                product_id=product.id,
+                price=product.price,
+                available=False,
+                change_type="out_of_stock",
+                recorded_at=now,
+            ))
+            summary["vanished"] += 1
 
     db.commit()
     return summary
