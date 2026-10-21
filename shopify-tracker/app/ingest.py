@@ -26,7 +26,7 @@ def classify_change(old_price: float, old_available: bool, new_price: float, new
 
 
 def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> dict:
-    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "vanished": 0, "collections": []}
+    summary = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "partial": 0, "vanished": 0, "collections": []}
     now = datetime.now(timezone.utc)
 
     for result in results:
@@ -46,14 +46,20 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
             "error": result.error,
         })
 
-        # A blocked/unavailable collection with no products is a skipped
-        # attempt, not a fatal ingest error. Partial results are still useful:
-        # ingest the rows we got, but never reconcile unseen products as gone
-        # unless the collection was fully fetched (ok/empty).
-        if result.status in ("error", "blocked", "unavailable") and not result.products:
-            if result.status == "error":
-                summary["errors"] += 1
+        # "error" and "blocked" (scraper.py's statuses for a collection
+        # that failed before getting ANY page at all) genuinely have
+        # nothing in result.products to ingest, so this is just a cheap
+        # skip, not data loss. "partial" (got some pages, then failed) DOES
+        # have real products in it and falls through to the normal ingest
+        # below instead of being thrown away -- that used to be lumped in
+        # with "error" and discarded wholesale, which meant a collection
+        # that successfully scraped pages 1-3 out of 4 lost pages 1-3's
+        # data too just because page 4 hit a rate limit.
+        if result.status in ("error", "blocked"):
+            summary["errors"] += 1
             continue
+        if result.status == "partial":
+            summary["partial"] += 1
 
         seen_variant_ids = set()
 
@@ -156,34 +162,41 @@ def ingest_results(db: Session, store_id: int, results: list[ScrapeResult]) -> d
         # deleting listings, only ever updating stock status.
         #
         # Only runs for a collection that scraped successfully this round
-        # ("ok" or "empty", not "error") -- a failed/timed-out scrape must
-        # never be read as "everything in this collection vanished", which
-        # would wrongly mark a whole collection's worth of real stock as
-        # sold out over a transient network hiccup.
-        if result.status not in ("ok", "empty"):
-            # Partial/blocked pages are not a complete inventory snapshot.
-            # Preserve previously tracked stock state and retry on a later run.
-            continue
-
-        vanished_query = db.query(Product).filter(
-            Product.store_id == store_id,
-            Product.collection_handle == result.collection_handle,
-            Product.available == True,  # noqa: E712 -- only touch rows that would actually change
-        )
-        if seen_variant_ids:
-            vanished_query = vanished_query.filter(~Product.variant_id.in_(seen_variant_ids))
-        vanished = vanished_query.all()
-        for product in vanished:
-            product.available = False
-            product.inventory_qty = 0
-            db.add(PriceHistory(
-                product_id=product.id,
-                price=product.price,
-                available=False,
-                change_type="out_of_stock",
-                recorded_at=now,
-            ))
-            summary["vanished"] += 1
+        # ("ok" or "empty") -- a scrape that didn't cleanly cover every page
+        # must never be read as "everything in this collection vanished".
+        # This comment used to describe intent the code below didn't
+        # actually enforce: the only thing that skipped this block before
+        # was the early `continue` on status == "error", which meant a
+        # "cancelled" scrape (user hit Stop partway through) or the new
+        # "partial" status (stopped partway through due to a rate limit)
+        # BOTH fell through to here and ran vanished-detection anyway --
+        # wrongly marking every real, still-in-stock product on whatever
+        # later pages never got fetched as "sold out", just because the
+        # scrape was cut short, not because anything actually changed on
+        # the source site. That's the opposite-direction version of the
+        # stale-stock bug: instead of failing to notice something sold
+        # out, it would have invented a false "out of stock" for products
+        # nobody ever even looked at this round.
+        if result.status in ("ok", "empty"):
+            vanished_query = db.query(Product).filter(
+                Product.store_id == store_id,
+                Product.collection_handle == result.collection_handle,
+                Product.available == True,  # noqa: E712 -- only touch rows that would actually change
+            )
+            if seen_variant_ids:
+                vanished_query = vanished_query.filter(~Product.variant_id.in_(seen_variant_ids))
+            vanished = vanished_query.all()
+            for product in vanished:
+                product.available = False
+                product.inventory_qty = 0
+                db.add(PriceHistory(
+                    product_id=product.id,
+                    price=product.price,
+                    available=False,
+                    change_type="out_of_stock",
+                    recorded_at=now,
+                ))
+                summary["vanished"] += 1
 
     db.commit()
     return summary

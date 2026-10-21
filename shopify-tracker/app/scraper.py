@@ -26,39 +26,38 @@ logger = logging.getLogger("scraper")
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 2
 REQUEST_TIMEOUT = 10
-# Lowered from 5, then from 2 -- even at concurrency 2, stores like Maria B
-# (mariab.ae) were still getting 429'd (seen live in Railway logs: repeated
-# "Rate limited (429) ... Waiting 60.0s (Retry-After=60)" against the same
-# collection). A collection that exhausts its rate-limit retries ends the
-# scrape as status="error" for that collection -- ingest.py correctly
-# refuses to treat an errored collection as "everything vanished" (so it
-# doesn't wrongly blank out real stock), but that also means whatever stock
-# data is already in the DB for it just goes stale instead of refreshing.
-# That's a real-money bug, not just a noisy log: a product can sell out on
-# the source site and this tracker never finds out, so it keeps telling the
-# client's own Shopify store the item is still available -- i.e. exactly
-# the mechanism behind an oversold order. Going to 1 (fully sequential
-# requests, no concurrency at all) trades scrape speed for not feeding
-# stale availability downstream.
-MAX_CONCURRENT_REQUESTS = 1
+# Lowered from 5 -- at concurrency 5, nearly every tracked store was
+# getting rate-limited (429) on nearly every collection, nearly every
+# night. These are modest-traffic Pakistani storefronts, not built to
+# absorb request bursts the way a high-traffic site would be.
+#
+# Briefly dropped all the way to 1 (plus a much bigger retry budget below)
+# to try to out-wait a store that kept 429'ing -- that backfired: at
+# concurrency 1, one stuck collection blocks every OTHER collection behind
+# it too, so a single hard-to-reach store could stall the entire store's
+# scrape for many minutes with nothing visibly happening. Back to 2.
+# What actually fixes the "stale stock from a failed scrape" problem isn't
+# brute-force patience here -- it's ingest.py now keeping whatever pages
+# DID succeed before a collection fails (see fetch_collection's "partial"
+# status below), instead of a failed collection discarding everything.
+MAX_CONCURRENT_REQUESTS = 2
 # Separate, more patient handling for 429s specifically: a rate limit is
 # fully recoverable given enough of a cooldown (unlike a genuine
 # connection failure), so it gets more attempts than MAX_ATTEMPTS and a
 # backoff that honors the site's own Retry-After header when it sends one
 # (most do) instead of guessing with the same short backoff as everything else.
-# Raised from 6 -- a store that keeps asking for a 60s cooldown via
-# Retry-After can burn through 6 attempts (6 minutes of waiting) and still
-# not have cooled down. Worth waiting longer in a background job rather
-# than giving up and leaving that collection's stock stale.
-MAX_RATE_LIMIT_ATTEMPTS = 10
+# Back to 6 (was briefly 10) -- now that a collection that runs out of
+# retries keeps whatever pages it already got (see "partial" status
+# below) rather than losing everything, there's much less reason to make
+# one page retry for up to 10 minutes before giving up. It'll just pick
+# up the rest on the next scrape.
+MAX_RATE_LIMIT_ATTEMPTS = 6
 RATE_LIMIT_BACKOFF_SECONDS = 8  # fallback wait when no Retry-After header is present
 # Small fixed pacing delay between consecutive page requests to the SAME
 # collection, on top of the concurrency cap above -- cheap extra insurance
 # against a simple "N requests per second" limiter that the concurrency
-# cap alone doesn't fully address. Raised from 0.4 alongside the
-# concurrency drop above, same reasoning: these are modest-traffic
-# storefronts that are still getting rate-limited at the previous pacing.
-PAGE_FETCH_DELAY_SECONDS = 1.0
+# cap alone doesn't fully address.
+PAGE_FETCH_DELAY_SECONDS = 0.4
 STORE_COUNTRY_HINT = "PK"  # see detect_store_currency() -- forces Pakistan-market localization
 
 # ---------------------------------------------------------------------------
@@ -653,7 +652,32 @@ async def fetch_collection(
                 await asyncio.sleep(PAGE_FETCH_DELAY_SECONDS)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            status = "error"
+            # Which status this becomes depends on whether any pages
+            # already succeeded before this one failed -- previously this
+            # was always "error" regardless, and ingest.py throws away
+            # EVERY product in a result whose status is "error" (see its
+            # docstring/comment), even ones from pages that genuinely
+            # succeeded. A collection that got through pages 1-3 fine and
+            # only failed on page 4 would lose pages 1-3's data too and
+            # show the same scary generic "Error" as a collection that
+            # never got anything at all -- confusing, and it threw away
+            # real, usable data for no reason. Now:
+            #   - got nothing at all + it was a 429 -> "blocked" ("Rate
+            #     limited" in the dashboard)
+            #   - got nothing at all + anything else -> "error"
+            #   - got SOME pages before failing -> "partial", and
+            #     ingest.py keeps those pages' products rather than
+            #     discarding them. The dashboard already has copy for
+            #     this ("Products from successful pages were saved;
+            #     retry later to fetch the remaining pages") -- it just
+            #     never had a backend that actually produced this status.
+            was_rate_limited = isinstance(e, aiohttp.ClientResponseError) and e.status == 429
+            if all_products:
+                status = "partial"
+            elif was_rate_limited:
+                status = "blocked"
+            else:
+                status = "error"
             error_msg = str(e)
         finally:
             if store_id is not None:

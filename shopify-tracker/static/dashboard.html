@@ -31,6 +31,15 @@
   .badge.error { background: rgba(255,107,107,0.15); color: var(--red); }
   .badge.empty { background: rgba(224,184,76,0.15); color: var(--yellow); }
   .badge.pending { background: rgba(154,161,172,0.15); color: var(--muted); }
+  /* "partial" and "blocked" were already handled in statusBadge()'s label
+     map below (and already distinguished from plain "error" in the
+     scrape-completion summary logic) but had no actual CSS -- they rendered
+     as an unstyled grey pill with no visual distinction from anything else.
+     partial = some real progress made, just not finished yet (same "needs
+     another pass, not broken" color as empty); blocked = the source site
+     itself is refusing requests (same urgency color as error). */
+  .badge.partial { background: rgba(224,184,76,0.15); color: var(--yellow); }
+  .badge.blocked { background: rgba(255,107,107,0.15); color: var(--red); }
   .muted { color: var(--muted); font-size: 12px; }
   tr.active-collection td { background: rgba(91,140,255,0.08); }
   img.thumb { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; vertical-align: middle; }
