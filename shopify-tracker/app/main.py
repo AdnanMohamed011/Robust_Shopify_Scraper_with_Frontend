@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -45,6 +47,125 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     shape the dashboard already knows how to display."""
     logging.error(f"Unhandled error on {request.method} {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {exc}"})
+
+
+# ---------- Login protection ----------
+# Use Starlette's signed session middleware so the browser keeps its login
+# across every dashboard fetch() request without needing Authorization headers.
+# Needs three Railway variables: TRACKER_USERNAME, TRACKER_PASSWORD,
+# TRACKER_SESSION_SECRET -- and `itsdangerous` in requirements.txt.
+AUTH_USERNAME = os.getenv("TRACKER_USERNAME")
+AUTH_PASSWORD = os.getenv("TRACKER_PASSWORD")
+AUTH_SECRET = os.getenv("TRACKER_SESSION_SECRET")
+
+if not AUTH_SECRET:
+    # A stable secret MUST be provided in production so sessions survive
+    # Railway restarts/redeploys. Refuse to start rather than silently making
+    # a new secret on every boot and invalidating all sessions.
+    raise RuntimeError("TRACKER_SESSION_SECRET is required")
+
+
+def _login_page(error: str | None = None) -> HTMLResponse:
+    message = f'<div style="color:#ff6b6b;margin-bottom:12px;">{error}</div>' if error else ""
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Product Tracker Login</title>
+<style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#e7e9ee;font-family:-apple-system,Segoe UI,Roboto,sans-serif}}
+.box{{width:320px;background:#171a21;border:1px solid #262a33;border-radius:10px;padding:24px}}
+h1{{font-size:18px;margin:0 0 18px}}
+input{{width:100%;box-sizing:border-box;background:#0f1115;border:1px solid #262a33;color:#e7e9ee;padding:10px;border-radius:6px;margin:6px 0 12px}}
+button{{width:100%;border:0;border-radius:6px;padding:10px;background:#5b8cff;color:white;cursor:pointer}}
+label{{font-size:12px;color:#9aa1ac}}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>Product Tracker</h1>
+{message}
+<form method="post" action="/login">
+<label>Username</label>
+<input name="username" autocomplete="username" required>
+<label>Password</label>
+<input type="password" name="password" autocomplete="current-password" required>
+<button type="submit">Login</button>
+</form>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    if not AUTH_USERNAME or not AUTH_PASSWORD:
+        return Response("Server authentication is not configured", status_code=503)
+    if request.session.get("authenticated"):
+        return RedirectResponse("/", status_code=303)
+    return _login_page()
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    if not AUTH_USERNAME or not AUTH_PASSWORD:
+        return Response("Server authentication is not configured", status_code=503)
+
+    from urllib.parse import parse_qs
+    body = (await request.body()).decode("utf-8", errors="replace")
+    form = parse_qs(body, keep_blank_values=True)
+    username = form.get("username", [""])[0]
+    password = form.get("password", [""])[0]
+
+    if username == AUTH_USERNAME and password == AUTH_PASSWORD:
+        request.session.clear()
+        request.session["authenticated"] = True
+        return RedirectResponse("/", status_code=303)
+
+    return _login_page("Invalid username or password.")
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    if not AUTH_USERNAME or not AUTH_PASSWORD:
+        return Response("Server authentication is not configured", status_code=503)
+
+    if request.url.path in {"/login"}:
+        return await call_next(request)
+
+    if request.session.get("authenticated") is True:
+        return await call_next(request)
+
+    # API callers need JSON/HTTP 401 rather than an HTML login page, because
+    # dashboard.js expects the API endpoints to return JSON.
+    if request.url.path.startswith((
+        "/stores", "/products", "/settings", "/scrape", "/export", "/alerts", "/scheduler"
+    )):
+        return Response("Authentication required", status_code=401)
+
+    return RedirectResponse("/login", status_code=303)
+
+
+# Added AFTER require_login on purpose: in Starlette the middleware added
+# last is the outermost one, and require_login reads request.session, so
+# SessionMiddleware has to wrap it (run first). With the order reversed,
+# every request would crash with "SessionMiddleware must be installed".
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=AUTH_SECRET,
+    session_cookie="tracker_session",
+    max_age=60 * 60 * 24 * 7,
+    same_site="lax",
+    https_only=True,
+)
 
 
 @app.on_event("startup")
@@ -483,12 +604,27 @@ async def run_scrape_for_store(store_id: int, only_handle: str | None = None):
         # Push updates into the client's own Shopify store right after
         # ingesting fresh data, so sync runs on the same 6-hour cadence as
         # scraping itself rather than needing a separate schedule.
+        #
+        # Same rule as run_scrape_for_store_sequential below: only sync
+        # collections whose scrape fully refreshed them. This used to call
+        # sync_store for the WHOLE store regardless of per-collection
+        # results, so collections that errored/were rate-limited were still
+        # pushed with stale stock. Now it syncs each fully-scraped
+        # collection individually and skips the rest.
         if store.api_sync_enabled and not was_cancelled:
-            try:
-                sync_summary = await shopify_sync.sync_store(db, store_id)
-                logging.info(f"Sync complete for store {store_id} ({store.name}): {sync_summary}")
-            except Exception as e:
-                logging.error(f"Sync failed for store {store_id} ({store.name}): {e}")
+            fresh_handles = [r.collection_handle for r in results if r.status in ("ok", "empty")]
+            skipped_handles = [r.collection_handle for r in results if r.status not in ("ok", "empty")]
+            if skipped_handles:
+                logging.warning(
+                    f"Skipping sync for store {store_id} ({store.name}) collections not fully scraped "
+                    f"this round: {skipped_handles} -- not pushing stale stock/prices to Shopify."
+                )
+            for handle in fresh_handles:
+                try:
+                    sync_summary = await shopify_sync.sync_store(db, store_id, collection_handle=handle)
+                    logging.info(f"Sync complete for store {store_id} ({store.name}), collection {handle}: {sync_summary}")
+                except Exception as e:
+                    logging.error(f"Sync failed for store {store_id} ({store.name}), collection {handle}: {e}")
 
         return summary
     finally:
@@ -543,7 +679,24 @@ async def run_scrape_for_store_sequential(store_id: int) -> dict:
                 logging.info(f"Sequential run for store {store_id} stopped early (cancelled) at collection {coll.handle}")
                 break
 
-            if store.api_sync_enabled:
+            # Only push a collection to the client's Shopify store if this
+            # round's scrape actually refreshed it ("ok"/"empty"). Before,
+            # this synced no matter what: a collection that hit "Giving up
+            # ... after 6 rate-limited (429) attempts" still had its old,
+            # never-refreshed DB rows pushed live a moment later (seen in the
+            # production logs: "Giving up on .../ss-wesst/..." immediately
+            # followed by "Sequential sync complete ... ss-wesst: matched
+            # 189"). That re-asserts last-known stock as if it were fresh --
+            # an item that sold out on the source site keeps showing in stock
+            # on the client's store, which is how oversells happen.
+            not_fresh = [r for r in results if r.status not in ("ok", "empty")]
+            if store.api_sync_enabled and not_fresh:
+                logging.warning(
+                    f"Skipping sync for store {store_id} ({store.name}), collection {coll.handle}: "
+                    f"scrape did not fully refresh it (status: {[r.status for r in not_fresh]}) -- "
+                    f"not pushing stale stock/prices to Shopify."
+                )
+            elif store.api_sync_enabled:
                 try:
                     sync_summary = await shopify_sync.sync_store(db, store_id, collection_handle=coll.handle)
                     logging.info(
